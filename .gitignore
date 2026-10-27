@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# files the app or a local build creates; never commit these
+settings.json
+crash.log
+error_*.txt
+playlist_*.txt
+*.new
+*.old
+.DS_Store

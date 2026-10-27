@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install dependencies",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pip", "install", "-r", "requirements.txt"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Install build tools",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pip", "install", "pyinstaller", "pillow"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Build executable (this OS)",
+      "type": "shell",
+      "dependsOn": ["Install dependencies", "Install build tools"],
+      "dependsOrder": "sequence",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+        "--name", "Retr0Downloader",
+        "--collect-all", "yt_dlp", "--collect-all", "yt_dlp_ejs", "--collect-all", "curl_cffi",
+        "--collect-all", "imageio_ffmpeg", "--collect-all", "deno", "--collect-all", "certifi",
+        "app.py"
+      ],
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    }
+  ]
+}

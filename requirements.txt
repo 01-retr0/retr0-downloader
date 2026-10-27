@@ -1,0 +1,6 @@
+yt-dlp[default,curl-cffi]
+yt-dlp-ejs
+deno
+imageio-ffmpeg
+certifi
+secretstorage; sys_platform == "linux"
