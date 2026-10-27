@@ -201,9 +201,10 @@ def find_deno() -> str:
     found = shutil.which("deno")
     if found:
         return found
-    base = getattr(sys, "_MEIPASS", None)  # the build bundles deno here
-    if base and (Path(base) / ("deno.exe" if IS_WIN else "deno")).exists():
-        return str(Path(base) / ("deno.exe" if IS_WIN else "deno"))
+    # The build bundles the binary in deno_bin/: a plain "deno" file would clash with the deno/ package folder.
+    bundled = Path(getattr(sys, "_MEIPASS", "")) / "deno_bin" / ("deno.exe" if IS_WIN else "deno")
+    if bundled.exists():
+        return str(bundled)
     try:
         import deno
         return str(deno.find_deno_bin())

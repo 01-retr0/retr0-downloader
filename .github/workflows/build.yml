@@ -80,7 +80,7 @@ jobs:
           --collect-all imageio_ffmpeg
           --collect-all deno
           --collect-all certifi
-          --add-binary "$DENO_BIN${{ matrix.sep }}."
+          --add-binary "$DENO_BIN${{ matrix.sep }}deno_bin"
           ${{ matrix.extra }}
           app.py
 
