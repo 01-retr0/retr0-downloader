@@ -1168,8 +1168,8 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
-        tk.Label(cf, text="YouTube login cookies are detected automatically when needed. You can also turn Cookies on "
-                          "to force a browser/profile; keep that browser signed in to YouTube.",
+        tk.Label(cf, text="On Windows, Cookies off disables browser-cookie detection. Turn it on to use the selected "
+                          "browser/profile; keep that browser signed in to YouTube. Linux keeps its existing automatic behavior.",
                  fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
@@ -1560,8 +1560,9 @@ class App:
         cookies = None
         if use_cookies and browser:
             cookies = (browser, profile) if profile else (browser,)
-        # Detect installed browser profiles. These are only opened if a site requires login.
-        fallback_cookies = detect_browser_cookie_sources(browser, profile)
+        # Keep Linux's existing automatic fallback. On Windows, the Cookies toggle controls
+        # whether detected browser profiles may be tried after an authentication challenge.
+        fallback_cookies = detect_browser_cookie_sources(browser, profile) if (use_cookies or not IS_WIN) else []
 
         self.cfg = {
             "out_dir": str(out_dir), "proxy": proxy_raw, "use_proxy": use_proxy,
@@ -1630,7 +1631,11 @@ class App:
 
             L(f"Output: {out_dir}", "dim")
             L(f"Proxy: {proxy or 'off'}", "dim")
-            L(f"Cookies: {cookies if cookies else 'automatic detection when needed'}", "dim")
+            cookie_status = cookies if cookies else (
+                "automatic detection when needed" if (fallback_cookies or not IS_WIN)
+                else "off (browser cookies disabled)"
+            )
+            L(f"Cookies: {cookie_status}", "dim")
             if fallback_cookies:
                 L(f"Detected {len(fallback_cookies)} browser cookie profile(s).", "dim")
             else:
