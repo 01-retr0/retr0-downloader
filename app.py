@@ -118,24 +118,102 @@ def default_out_dir() -> Path:
 
 
 def default_profile() -> str:
-    """Opera GX profile directory for this OS, or '' if not found."""
-    candidates = []
-    if IS_WIN:
-        appdata = os.environ.get("APPDATA", "")
-        if appdata:
-            candidates.append(Path(appdata) / "Opera Software" / "Opera GX Stable")
-    elif IS_MAC:
-        candidates.append(Path.home() / "Library/Application Support/com.operasoftware.OperaGX")
-    else:
-        candidates.append(Path.home() / ".var/app/com.opera.opera-gx/config/opera-gx")
-        candidates.append(Path.home() / ".config/opera-gx")
-    for c in candidates:
-        if c.exists():
-            return str(c)
+    """Return a detected Opera GX profile path, or an empty string."""
+    for root in browser_profile_roots().get("opera", []):
+        profiles = _profiles_under(root, "chromium")
+        if profiles:
+            return str(profiles[0])
+        if root.exists():
+            return str(root)
     return ""
 
 
 BROWSERS = ["opera", "chrome", "edge", "firefox", "brave", "vivaldi", "chromium"]
+
+
+def browser_profile_roots() -> dict:
+    """Known browser data roots on Windows, macOS, Linux, and common Flatpaks."""
+    h = Path.home()
+    roots = {name: [] for name in BROWSERS}
+    if IS_WIN:
+        local = Path(os.environ.get("LOCALAPPDATA", h / "AppData/Local"))
+        roaming = Path(os.environ.get("APPDATA", h / "AppData/Roaming"))
+        roots["chrome"] += [local / "Google/Chrome/User Data"]
+        roots["edge"] += [local / "Microsoft/Edge/User Data"]
+        roots["brave"] += [local / "BraveSoftware/Brave-Browser/User Data"]
+        roots["vivaldi"] += [local / "Vivaldi/User Data"]
+        roots["chromium"] += [local / "Chromium/User Data"]
+        roots["opera"] += [roaming / "Opera Software/Opera Stable", roaming / "Opera Software/Opera GX Stable"]
+        roots["firefox"] += [roaming / "Mozilla/Firefox/Profiles"]
+    elif IS_MAC:
+        base = h / "Library/Application Support"
+        roots["chrome"] += [base / "Google/Chrome"]
+        roots["edge"] += [base / "Microsoft Edge"]
+        roots["brave"] += [base / "BraveSoftware/Brave-Browser"]
+        roots["vivaldi"] += [base / "Vivaldi"]
+        roots["chromium"] += [base / "Chromium"]
+        roots["opera"] += [base / "com.operasoftware.Opera", base / "com.operasoftware.OperaGX"]
+        roots["firefox"] += [h / "Library/Application Support/Firefox/Profiles"]
+    else:
+        base = h / ".config"
+        roots["chrome"] += [base / "google-chrome", base / "google-chrome-beta", h / ".var/app/com.google.Chrome/config/google-chrome"]
+        roots["edge"] += [base / "microsoft-edge", h / ".var/app/com.microsoft.Edge/config/microsoft-edge"]
+        roots["brave"] += [base / "BraveSoftware/Brave-Browser", h / ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"]
+        roots["vivaldi"] += [base / "vivaldi"]
+        roots["chromium"] += [base / "chromium", h / ".var/app/org.chromium.Chromium/config/chromium"]
+        roots["opera"] += [base / "opera", base / "opera-gx", h / ".var/app/com.opera.opera/config/opera", h / ".var/app/com.opera.opera-gx/config/opera-gx"]
+        roots["firefox"] += [h / ".mozilla/firefox", h / ".var/app/org.mozilla.firefox/.mozilla/firefox"]
+    return roots
+
+
+def _profiles_under(root: Path, browser_kind: str) -> list:
+    """Find actual browser profile directories containing cookie databases."""
+    found = []
+    try:
+        if not root.is_dir():
+            return found
+        if browser_kind == "firefox":
+            for db in root.glob("*/cookies.sqlite"):
+                found.append(db.parent)
+            # Firefox may store profiles under a nested Profiles directory.
+            for db in root.glob("Profiles/*/cookies.sqlite"):
+                found.append(db.parent)
+        else:
+            for profile in [root / "Default", *sorted(root.glob("Profile *")), root]:
+                if not profile.is_dir():
+                    continue
+                if (profile / "Network/Cookies").is_file() or (profile / "Cookies").is_file():
+                    found.append(profile)
+    except OSError:
+        pass
+    # Keep order, remove duplicates.
+    return list(dict.fromkeys(found))
+
+
+def detect_browser_cookie_sources(preferred_browser="", preferred_profile="") -> list:
+    """Return ordered yt-dlp browser-cookie tuples for profiles found on this PC."""
+    sources = []
+    seen = set()
+
+    def add(browser, profile=""):
+        if browser not in BROWSERS:
+            return
+        item = (browser, str(profile)) if profile else (browser,)
+        if item not in seen:
+            seen.add(item)
+            sources.append(item)
+
+    # Respect an explicit profile first, even if its cookie database is not detectable by filename.
+    if preferred_browser and preferred_profile:
+        add(preferred_browser, preferred_profile)
+    roots = browser_profile_roots()
+    order = [preferred_browser] if preferred_browser in BROWSERS else []
+    order += [b for b in BROWSERS if b not in order]
+    for browser in order:
+        for root in roots.get(browser, []):
+            for profile in _profiles_under(root, "firefox" if browser == "firefox" else "chromium"):
+                add(browser, profile)
+    return sources
 
 
 def load_settings() -> dict:
@@ -531,7 +609,7 @@ def is_youtube_playlist(url: str) -> bool:
     return True
 
 
-def fetch_playlist_links(url: str, proxy: str, cookies) -> tuple:
+def fetch_playlist_links(url: str, proxy: str, cookies, fallback_cookies=None) -> tuple:
     """Return (title, [video urls]) using a flat extraction (nothing is downloaded)."""
     lst = parse_qs(urlparse(url).query).get("list", [""])[0]
     canonical = f"https://www.youtube.com/playlist?list={lst}"
@@ -554,12 +632,40 @@ def fetch_playlist_links(url: str, proxy: str, cookies) -> tuple:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(canonical, download=False)
 
-    try:
-        info = attempt(cookies)
-    except Exception:
-        if not cookies:
+    tried = set()
+    sources = []
+    if cookies:
+        sources.append(tuple(cookies))
+    sources.extend(tuple(c) for c in (fallback_cookies or []))
+    sources.append(None)
+    info = None
+    last_error = None
+    for ck in sources:
+        marker = tuple(ck) if ck else None
+        if marker in tried:
+            continue
+        tried.add(marker)
+        try:
+            info = attempt(ck)
+            break
+        except Exception as exc:
+            last_error = exc
+            message = clean(exc).lower()
+            auth_or_cookie_error = any(term in message for term in (
+                "sign in", "login required", "authentication", "not a bot", "cookie",
+                "cookies", "database is locked", "could not copy",
+            ))
+            # Only try another browser profile for likely authentication/cookie errors.
+            if not auth_or_cookie_error:
+                raise
+            if ck:
+                # Continue through detected profiles; a later one may contain the valid login.
+                continue
             raise
-        info = attempt(None)
+    if info is None:
+        if last_error:
+            raise last_error
+        raise RuntimeError("Could not read playlist information")
 
     links = []
     for e in (info or {}).get("entries") or []:
@@ -1029,8 +1135,8 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
-        tk.Label(cf, text="If a site refuses the download, turn Cookies on and pick the browser you are "
-                          "logged in to that site with. The app then uses your login to get the video.",
+        tk.Label(cf, text="YouTube login cookies are detected automatically when needed. You can also turn Cookies on "
+                          "to force a browser/profile; keep that browser signed in to YouTube.",
                  fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
@@ -1408,6 +1514,8 @@ class App:
         cookies = None
         if use_cookies and browser:
             cookies = (browser, profile) if profile else (browser,)
+        # Detect installed browser profiles. These are only opened if a site requires login.
+        fallback_cookies = detect_browser_cookie_sources(browser, profile)
 
         self.cfg = {
             "out_dir": str(out_dir), "proxy": proxy_raw, "use_proxy": use_proxy,
@@ -1418,9 +1526,13 @@ class App:
         proxy = normalize_proxy(proxy_raw) if use_proxy else ""
         self.cancel.clear()
         self.set_busy(True)
-        threading.Thread(target=self.worker, args=(raw, out_dir, proxy, cookies), daemon=True).start()
+        threading.Thread(
+            target=self.worker,
+            args=(raw, out_dir, proxy, cookies, fallback_cookies),
+            daemon=True,
+        ).start()
 
-    def worker(self, user_input, out_dir, proxy, cookies):
+    def worker(self, user_input, out_dir, proxy, cookies, fallback_cookies=None):
         q = self.q
 
         def L(msg, tag="text"):
@@ -1447,7 +1559,7 @@ class App:
                 S("Reading playlist...")
                 links, title = [], "playlist"
                 try:
-                    title, links = fetch_playlist_links(user_input, proxy, cookies)
+                    title, links = fetch_playlist_links(user_input, proxy, cookies, fallback_cookies)
                 except Exception as e:
                     L(f"Playlist fetch failed: {clean(e)}", "warn")
                 if links:
@@ -1472,7 +1584,11 @@ class App:
 
             L(f"Output: {out_dir}", "dim")
             L(f"Proxy: {proxy or 'off'}", "dim")
-            L(f"Cookies: {cookies if cookies else 'off'}", "dim")
+            L(f"Cookies: {cookies if cookies else 'automatic detection when needed'}", "dim")
+            if fallback_cookies:
+                L(f"Detected {len(fallback_cookies)} browser cookie profile(s).", "dim")
+            else:
+                L("No known browser cookie profiles detected; sign in to YouTube in a supported browser.", "dim")
             S("Downloading...")
             P(0)
 
@@ -1502,6 +1618,10 @@ class App:
 
                 try:
                     use_ck, use_imp = cookies, True
+                    cookie_index = -1
+                    tried_cookie_sources = set()
+                    if use_ck:
+                        tried_cookie_sources.add(tuple(use_ck))
                     while True:
                         try:
                             download_video(url, out_dir, proxy, use_ck, progress_callback=cb,
@@ -1512,9 +1632,27 @@ class App:
                             raise
                         except Exception as first:
                             m = clean(first).lower()
-                            if use_ck and "cookie" in m:
-                                L("Cookie load failed. Retrying without cookies.", "warn")
-                                use_ck = None
+                            auth_challenge = any(
+                                phrase in m for phrase in (
+                                    "sign in to confirm", "login required", "authentication",
+                                    "confirm you're not a bot", "confirm you’re not a bot",
+                                )
+                            )
+                            is_youtube = "youtube.com" in url.lower() or "youtu.be/" in url.lower()
+                            cookie_problem = use_ck and any(k in m for k in ("cookie", "database is locked", "could not copy"))
+                            if is_youtube and (auth_challenge or cookie_problem) and fallback_cookies:
+                                next_source = next((tuple(c) for c in fallback_cookies
+                                                    if tuple(c) not in tried_cookie_sources), None)
+                                if next_source:
+                                    tried_cookie_sources.add(next_source)
+                                    use_ck = next_source
+                                    label = next_source[0] + (f" ({next_source[1]})" if len(next_source) > 1 else "")
+                                    L(f"Trying YouTube cookies from detected browser profile: {label}", "warn")
+                                elif use_ck:
+                                    # Avoid a misleading second cookie error; let the original failure surface.
+                                    raise
+                                else:
+                                    raise
                             elif use_imp and any(k in m for k in ("curl:", "http/2", "protocol_error", "stream")):
                                 L("Transport error. Retrying without browser impersonation.", "warn")
                                 use_imp = False
