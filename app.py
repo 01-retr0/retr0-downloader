@@ -1168,8 +1168,8 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
-        tk.Label(cf, text="On Windows, Cookies off disables browser-cookie detection. Turn it on to use the selected "
-                          "browser/profile; keep that browser signed in to YouTube. Linux keeps its existing automatic behavior.",
+        tk.Label(cf, text="Cookies on: always use the selected browser/profile. Cookies off: browser cookies are tried "
+                          "automatically only if YouTube asks to sign in. Keep a browser signed in to YouTube.",
                  fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
@@ -1560,9 +1560,9 @@ class App:
         cookies = None
         if use_cookies and browser:
             cookies = (browser, profile) if profile else (browser,)
-        # Keep Linux's existing automatic fallback. On Windows, the Cookies toggle controls
-        # whether detected browser profiles may be tried after an authentication challenge.
-        fallback_cookies = detect_browser_cookie_sources(browser, profile) if (use_cookies or not IS_WIN) else []
+        # Detected browser profiles are the automatic fallback when YouTube asks to sign in.
+        # Same behavior on Windows and Linux, regardless of the Cookies toggle.
+        fallback_cookies = detect_browser_cookie_sources(browser, profile)
 
         self.cfg = {
             "out_dir": str(out_dir), "proxy": proxy_raw, "use_proxy": use_proxy,
@@ -1631,10 +1631,7 @@ class App:
 
             L(f"Output: {out_dir}", "dim")
             L(f"Proxy: {proxy or 'off'}", "dim")
-            cookie_status = cookies if cookies else (
-                "automatic detection when needed" if (fallback_cookies or not IS_WIN)
-                else "off (browser cookies disabled)"
-            )
+            cookie_status = cookies if cookies else "automatic detection when needed"
             L(f"Cookies: {cookie_status}", "dim")
             if fallback_cookies:
                 L(f"Detected {len(fallback_cookies)} browser cookie profile(s).", "dim")
@@ -1669,7 +1666,6 @@ class App:
 
                 try:
                     use_ck, use_imp = cookies, True
-                    cookie_index = -1
                     tried_cookie_sources = set()
                     if use_ck:
                         tried_cookie_sources.add(tuple(use_ck))
@@ -1686,11 +1682,15 @@ class App:
                             auth_challenge = any(
                                 phrase in m for phrase in (
                                     "sign in to confirm", "login required", "authentication",
-                                    "confirm you're not a bot", "confirm you’re not a bot",
+                                    "confirm you're not a bot", "confirm you\u2019re not a bot",
+                                    "not a bot", "sign in",
                                 )
                             )
                             is_youtube = "youtube.com" in url.lower() or "youtu.be/" in url.lower()
-                            cookie_problem = use_ck and any(k in m for k in (     "cookie",     "database is locked",     "could not copy",     "dpapi",     "failed to decrypt", ))
+                            cookie_problem = bool(use_ck) and any(k in m for k in (
+                                "cookie", "database is locked", "could not copy", "dpapi",
+                                "failed to decrypt",
+                            ))
                             if is_youtube and (auth_challenge or cookie_problem) and fallback_cookies:
                                 next_source = next((tuple(c) for c in fallback_cookies
                                                     if tuple(c) not in tried_cookie_sources), None)
@@ -1699,10 +1699,8 @@ class App:
                                     use_ck = next_source
                                     label = next_source[0] + (f" ({next_source[1]})" if len(next_source) > 1 else "")
                                     L(f"Trying YouTube cookies from detected browser profile: {label}", "warn")
-                                elif use_ck:
-                                    # Avoid a misleading second cookie error; let the original failure surface.
-                                    raise
                                 else:
+                                    # Every detected profile was tried; surface the failure.
                                     raise
                             elif use_imp and any(k in m for k in ("curl:", "http/2", "protocol_error", "stream")):
                                 L("Transport error. Retrying without browser impersonation.", "warn")
