@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retr0 Downloader: desktop GUI around yt-dlp. Created By Retr0."""
 import hashlib
+import configparser
 import json
 import os
 import platform
@@ -144,7 +145,7 @@ def browser_profile_roots() -> dict:
         roots["vivaldi"] += [local / "Vivaldi/User Data"]
         roots["chromium"] += [local / "Chromium/User Data"]
         roots["opera"] += [roaming / "Opera Software/Opera Stable", roaming / "Opera Software/Opera GX Stable"]
-        roots["firefox"] += [roaming / "Mozilla/Firefox/Profiles"]
+        roots["firefox"] += [roaming / "Mozilla/Firefox", roaming / "Mozilla/Firefox/Profiles"]
     elif IS_MAC:
         base = h / "Library/Application Support"
         roots["chrome"] += [base / "Google/Chrome"]
@@ -153,7 +154,7 @@ def browser_profile_roots() -> dict:
         roots["vivaldi"] += [base / "Vivaldi"]
         roots["chromium"] += [base / "Chromium"]
         roots["opera"] += [base / "com.operasoftware.Opera", base / "com.operasoftware.OperaGX"]
-        roots["firefox"] += [h / "Library/Application Support/Firefox/Profiles"]
+        roots["firefox"] += [h / "Library/Application Support/Firefox", h / "Library/Application Support/Firefox/Profiles"]
     else:
         base = h / ".config"
         roots["chrome"] += [base / "google-chrome", base / "google-chrome-beta", h / ".var/app/com.google.Chrome/config/google-chrome"]
@@ -162,20 +163,50 @@ def browser_profile_roots() -> dict:
         roots["vivaldi"] += [base / "vivaldi"]
         roots["chromium"] += [base / "chromium", h / ".var/app/org.chromium.Chromium/config/chromium"]
         roots["opera"] += [base / "opera", base / "opera-gx", h / ".var/app/com.opera.opera/config/opera", h / ".var/app/com.opera.opera-gx/config/opera-gx"]
-        roots["firefox"] += [h / ".mozilla/firefox", h / ".var/app/org.mozilla.firefox/.mozilla/firefox"]
+        roots["firefox"] += [
+            h / ".mozilla/firefox",
+            h / ".var/app/org.mozilla.firefox/.mozilla/firefox",
+            h / "snap/firefox/common/.mozilla/firefox",
+            h / "snap/firefox/current/.mozilla/firefox",
+            h / "snap/firefox/common/.mozilla",
+            h / "snap/firefox/current/.mozilla",
+        ]
     return roots
 
 
 def _profiles_under(root: Path, browser_kind: str) -> list:
-    """Find actual browser profile directories containing cookie databases."""
+    """Find browser profiles with cookie stores, including configured Firefox/Snap profiles."""
     found = []
     try:
         if not root.is_dir():
             return found
         if browser_kind == "firefox":
+            # Firefox profile locations are configurable; discover them from profiles.ini
+            # as well as checking common directory layouts.
+            ini_candidates = [root / "profiles.ini", root.parent / "profiles.ini"]
+            for ini in ini_candidates:
+                if not ini.is_file():
+                    continue
+                parser = configparser.ConfigParser()
+                try:
+                    parser.read(ini, encoding="utf-8")
+                    for section in parser.sections():
+                        if not section.lower().startswith("profile"):
+                            continue
+                        rel = parser.get(section, "Path", fallback="").strip()
+                        if not rel:
+                            continue
+                        is_relative = parser.getboolean(section, "IsRelative", fallback=True)
+                        base = ini.parent if is_relative else Path("/")
+                        profile = (base / rel).expanduser() if is_relative else Path(rel).expanduser()
+                        if (profile / "cookies.sqlite").is_file():
+                            found.append(profile)
+                except (OSError, configparser.Error, ValueError):
+                    pass
+            if (root / "cookies.sqlite").is_file():
+                found.append(root)
             for db in root.glob("*/cookies.sqlite"):
                 found.append(db.parent)
-            # Firefox may store profiles under a nested Profiles directory.
             for db in root.glob("Profiles/*/cookies.sqlite"):
                 found.append(db.parent)
         else:
@@ -1093,8 +1124,10 @@ class App:
         self.url_entry.grid(row=0, column=1, sticky="ew", ipady=ipad, pady=rp)
         self.url_entry.bind("<Return>", lambda e: self.start_download())
         Btn(body, "Paste", self.paste, CYAN, font=self.f_bold).grid(
-            row=0, column=2, columnspan=2, sticky="ew", padx=(px(10), 0), pady=rp)
-        tk.Label(body, text="Link of any page with a video, a YouTube playlist, or a .txt file with one link per line",
+            row=0, column=2, sticky="ew", padx=(px(10), 0), pady=rp)
+        Btn(body, "Choose .txt", self.choose_url_file, CYAN, font=self.f_bold).grid(
+            row=0, column=3, sticky="ew", padx=(px(10), 0), pady=rp)
+        tk.Label(body, text="Paste a video/playlist link, or choose a .txt file containing one link per line",
                  fg=DIM, bg=BG, font=self.f_mono, anchor="w").grid(row=1, column=1, columnspan=3, sticky="w")
 
         # Save path
@@ -1220,6 +1253,19 @@ class App:
         self.var_url.set(first)
         self.url_entry.focus_set()
         self.url_entry.icursor("end")
+
+    def choose_url_file(self):
+        """Choose a text file containing video links, without typing its path."""
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select a text file containing video links",
+            initialdir=str(Path.home()),
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.var_url.set(chosen)
+            self.var_status.set(f"Selected link list: {Path(chosen).name}")
+            self.url_entry.icursor("end")
 
     def out_path(self) -> Path:
         raw = self.var_out.get().strip()
