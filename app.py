@@ -1685,7 +1685,7 @@ class App:
                                 )
                             )
                             is_youtube = "youtube.com" in url.lower() or "youtu.be/" in url.lower()
-                            cookie_problem = use_ck and any(k in m for k in ("cookie", "database is locked", "could not copy"))
+                            cookie_problem = use_ck and any(k in m for k in (     "cookie",     "database is locked",     "could not copy",     "dpapi",     "failed to decrypt", ))
                             if is_youtube and (auth_challenge or cookie_problem) and fallback_cookies:
                                 next_source = next((tuple(c) for c in fallback_cookies
                                                     if tuple(c) not in tried_cookie_sources), None)
