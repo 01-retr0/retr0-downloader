@@ -1171,8 +1171,8 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
-        tk.Label(cf, text="Cookies on: always use the selected browser/profile. Cookies off: browser cookies are tried "
-                          "automatically only if YouTube asks to sign in. Keep a browser signed in to YouTube.",
+        tk.Label(cf, text="Load your browser cookies, or leave the profile empty for the default location. "
+                          "For YouTube, use Firefox.",
                  fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
@@ -1190,10 +1190,7 @@ class App:
         self.btn_stop.pack(side="left", padx=(0, px(10)))
         self.btn_stop.set_enabled(False)
         Btn(left, "Clear", self.clear_log, CYAN, font=self.f_bold).pack(side="left")
-        self.btn_upd_pkg = Btn(right, "Update packages",
-                               self.update_packages, CYAN, font=self.f_bold)
-        self.btn_upd_pkg.pack(side="left", padx=(0, px(10)))
-        self.btn_upd_app = Btn(right, "Update app", self.update_app, CYAN, font=self.f_bold)
+        self.btn_upd_app = Btn(right, "Update", self.update_all, CYAN, font=self.f_bold)
         self.btn_upd_app.pack(side="left")
 
         # Status and progress
@@ -1380,8 +1377,6 @@ class App:
 
     def set_update_buttons(self, on):
         self.btn_upd_app.set_enabled(on)
-        if self.btn_upd_pkg is not None:
-            self.btn_upd_pkg.set_enabled(on)
 
     def _begin_update(self, target, *args) -> bool:
         if self.busy or self.updating:
@@ -1392,17 +1387,17 @@ class App:
         threading.Thread(target=target, args=args, daemon=True).start()
         return True
 
-    def update_app(self):
-        if FROZEN:
-            self._begin_update(self.update_check_worker, self.current_proxy(), False)
-        else:
-            self._begin_update(self.update_source_worker)
-
-    def update_packages(self):
+    def update_all(self):
+        """One button: update the packages, then check for a newer app."""
         if FROZEN:
             self._begin_update(self.update_ytdlp_worker, self.current_proxy())
         else:
-            self._begin_update(self.update_packages_worker, self.current_proxy())
+            self._begin_update(self.update_all_source_worker, self.current_proxy())
+
+    def update_all_source_worker(self, proxy):
+        self.update_packages_worker(proxy, finish=False)
+        self.update_source_worker(finish=False)
+        self.q.put(("update_done",))
 
     def update_ytdlp_worker(self, proxy):
         q = self.q
@@ -1484,7 +1479,7 @@ class App:
             q.put(("progress", 0))
             q.put(("update_done",))
 
-    def update_source_worker(self):
+    def update_source_worker(self, finish=True):
         q = self.q
         repo_dir = Path(__file__).resolve().parent
         try:
@@ -1503,9 +1498,10 @@ class App:
                 q.put(("log", "No GitHub repository is configured (set REPO in app_version.py).", "warn"))
         except Exception as e:
             q.put(("log", f"Update failed: {clean(e)}", "err"))
-        q.put(("update_done",))
+        if finish:
+            q.put(("update_done",))
 
-    def update_packages_worker(self, proxy):
+    def update_packages_worker(self, proxy, finish=True):
         q = self.q
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
         if proxy.startswith("http"):
@@ -1529,7 +1525,8 @@ class App:
                                   "install with .venv/bin/pip (see README).", "warn"))
         except Exception as e:
             q.put(("log", f"Update failed: {clean(e)}", "err"))
-        q.put(("update_done",))
+        if finish:
+            q.put(("update_done",))
 
     def start_download(self):
         if self.updating:
