@@ -35,11 +35,13 @@ jobs:
             name: Retr0Downloader
             file: Retr0Downloader.exe
             icon: "--icon icon.ico"
+            sep: ";"
             extra: ""
           - os: ubuntu-22.04
             name: Retr0Downloader-linux
             file: Retr0Downloader-linux
             icon: ""
+            sep: ":"
             extra: "--hidden-import secretstorage --hidden-import jeepney"
     runs-on: ${{ matrix.os }}
     defaults:
@@ -64,6 +66,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller pillow
 
+      - name: Locate Deno
+        run: echo "DENO_BIN=$(python -c "import shutil, deno; print(shutil.which('deno') or deno.find_deno_bin())")" >> "$GITHUB_ENV"
+
       - name: Build
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
@@ -75,6 +80,7 @@ jobs:
           --collect-all imageio_ffmpeg
           --collect-all deno
           --collect-all certifi
+          --add-binary "$DENO_BIN${{ matrix.sep }}."
           ${{ matrix.extra }}
           app.py
 

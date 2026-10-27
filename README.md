@@ -1,8 +1,8 @@
 # Retr0 Downloader
 
-A simple desktop app for downloading videos in the highest available quality. Windows and Linux. No Python or command line needed. Created By Retr0.
+A simple desktop app that downloads the video from any web page. Copy the link of a page that has a video, paste it into the app, and get the video in the highest available quality. It works with YouTube, Instagram and almost any other site with a video player. Windows and Linux, no Python or command line needed. Created By Retr0.
 
-Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), so it works with the many sites yt-dlp supports.
+Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports thousands of sites.
 
 ## Download
 
@@ -24,17 +24,18 @@ To add it to your app menu, also download `install_linux.sh` and `icon.png` from
 
 ## Features
 
+- Works with almost any site that has a video, not only YouTube
 - Highest quality video and audio, merged into one file
-- Paste a link, a YouTube playlist, or a `.txt` file with one link per line
+- Paste the link of a page, a YouTube playlist, or a `.txt` file with one link per line
 - Choose where files are saved, with Browse and Open buttons
 - Optional proxy (`host:port` or `socks5://host:port`)
-- Optional browser cookies for sites that need a login
+- Browser cookies for sites that refuse the download: log in to the site in your browser, turn Cookies on, and the app uses your login to get the video
 - Stop button, progress bar and a live log
 
 ## Updating
 
 - **Update app** checks this page for a newer version, downloads it, verifies it and restarts itself.
-- **Update yt-dlp** installs the newest download engine without a new app version. Use it when a site stops working.
+- **Update packages** installs the newest download engine (yt-dlp) and checks whether a newer app version, with fresh ffmpeg, Deno and curl_cffi, is available. Use it when a site stops working.
 
 The app file must be in a folder you can write to, such as Desktop or Downloads, not Program Files.
 

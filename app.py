@@ -33,7 +33,7 @@ try:
 except Exception:
     VERSION, REPO = "dev", ""
 
-# In the packaged app, a newer yt-dlp downloaded by "Update yt-dlp" lives in LIB_DIR and
+# In the packaged app, a newer yt-dlp downloaded by "Update packages" lives in LIB_DIR and
 # takes priority over the copy bundled in the exe. LIB_DIR is wiped whenever the app itself
 # is updated, so a new release never runs on top of an older downloaded package.
 _BASE = (Path(os.environ.get("APPDATA", Path.home())) if platform.system() == "Windows"
@@ -201,11 +201,25 @@ def find_deno() -> str:
     found = shutil.which("deno")
     if found:
         return found
+    base = getattr(sys, "_MEIPASS", None)  # the build bundles deno here
+    if base and (Path(base) / ("deno.exe" if IS_WIN else "deno")).exists():
+        return str(Path(base) / ("deno.exe" if IS_WIN else "deno"))
     try:
         import deno
         return str(deno.find_deno_bin())
     except Exception:
         return ""
+
+
+def host_env() -> dict:
+    """Environment for system programs (zenity, xdg-open). A PyInstaller app points
+    LD_LIBRARY_PATH at its own libraries, which makes those programs crash."""
+    env = dict(os.environ)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
 
 
 def open_folder(path: Path) -> bool:
@@ -218,7 +232,7 @@ def open_folder(path: Path) -> bool:
         else:
             subprocess.Popen(
                 ["xdg-open", str(path)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=host_env(),
             )
         return True
     except Exception:
@@ -489,10 +503,12 @@ def linux_pick_folder(start: str):
     else:
         return None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=host_env())
     except Exception:
         return None
-    return r.stdout.strip() if r.returncode == 0 else ""
+    if r.returncode == 0:
+        return r.stdout.strip()
+    return "" if r.returncode == 1 else None  # 1 = cancelled; anything else = the helper crashed
 
 
 # ======================================
@@ -661,6 +677,29 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
 # ======================================
 # Widgets
 # ======================================
+# Physical keys for C, V, X, A. Tk matches Ctrl+<letter> by the typed letter, so on a
+# non-Latin layout (Persian, Russian...) the default shortcuts never fire.
+CTRL_KEYS = {67: "c", 86: "v", 88: "x", 65: "a"} if IS_WIN else {54: "c", 55: "v", 53: "x", 38: "a"}
+
+
+def ctrl_shortcut(e):
+    if IS_MAC or e.keysym.lower() in ("c", "v", "x", "a"):
+        return None  # Latin layout: Tk's own binding handles it
+    act = CTRL_KEYS.get(e.keycode)
+    if not act:
+        return None
+    w = e.widget
+    if act == "a":
+        if isinstance(w, tk.Entry):
+            w.select_range(0, "end")
+            w.icursor("end")
+        else:
+            w.tag_add("sel", "1.0", "end")
+    else:
+        w.event_generate({"c": "<<Copy>>", "v": "<<Paste>>", "x": "<<Cut>>"}[act])
+    return "break"
+
+
 class Btn(tk.Label):
     """Flat label-based button: full colour control on every OS."""
 
@@ -767,7 +806,7 @@ class Splash(tk.Canvas):
         self.frame = 0
         self.finished = False
         self.place(x=0, y=0, relwidth=1, relheight=1)
-        self.lift()
+        self.tk.call("raise", self._w)  # Canvas.lift() means tag_raise, so raise the widget directly
         self.focus_set()
         self.bind("<Button-1>", self.finish)
         self.bind("<Key>", self.finish)
@@ -873,7 +912,7 @@ class App:
         if not find_ffmpeg():
             self.write("FFmpeg not found. Highest quality needs it to merge video and audio.", "err")
         if not find_deno():
-            self.write("Deno not found. YouTube downloads may fail without it.", "warn")
+            self.write("Deno not found. Some sites, YouTube especially, may fail without it.", "warn")
 
         ytv = getattr(getattr(yt_dlp, "version", None), "__version__", "?")
         self.write(f"App version: {VERSION}    yt-dlp: {ytv}", "dim")
@@ -927,7 +966,7 @@ class App:
         pad = px(24)
         top = tk.Frame(self.root, bg=PANEL)
         top.pack(fill="x")
-        tk.Label(top, text="RETR0 // HIGHEST QUALITY DOWNLOADER", fg=GREEN, bg=PANEL,
+        tk.Label(top, text="RETR0 // Highest-Quality Video Downloader", fg=GREEN, bg=PANEL,
                  font=self.f_title).pack(side="left", padx=pad, pady=px(14))
         tk.Label(top, text=f"Created By Retr0   {VERSION}", fg=PINK, bg=PANEL,
                  font=self.f_bold).pack(side="right", padx=pad)
@@ -948,7 +987,7 @@ class App:
         self.url_entry.bind("<Return>", lambda e: self.start_download())
         Btn(body, "Paste", self.paste, CYAN, font=self.f_bold).grid(
             row=0, column=2, columnspan=2, sticky="ew", padx=(px(10), 0), pady=rp)
-        tk.Label(body, text="A video link, a YouTube playlist, or a .txt file with one link per line",
+        tk.Label(body, text="Link of any page with a video, a YouTube playlist, or a .txt file with one link per line",
                  fg=DIM, bg=BG, font=self.f_mono, anchor="w").grid(row=1, column=1, columnspan=3, sticky="w")
 
         # Save path
@@ -989,6 +1028,10 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
+        tk.Label(cf, text="If a site refuses the download, turn Cookies on and pick the browser you are "
+                          "logged in to that site with. The app then uses your login to get the video.",
+                 fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
+                 anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
         # Action buttons
         bf = tk.Frame(body, bg=BG)
@@ -1004,7 +1047,7 @@ class App:
         self.btn_stop.pack(side="left", padx=(0, px(10)))
         self.btn_stop.set_enabled(False)
         Btn(left, "Clear", self.clear_log, CYAN, font=self.f_bold).pack(side="left")
-        self.btn_upd_pkg = Btn(right, "Update yt-dlp" if FROZEN else "Update packages",
+        self.btn_upd_pkg = Btn(right, "Update packages",
                                self.update_packages, CYAN, font=self.f_bold)
         self.btn_upd_pkg.pack(side="left", padx=(0, px(10)))
         self.btn_upd_app = Btn(right, "Update app", self.update_app, CYAN, font=self.f_bold)
@@ -1207,14 +1250,17 @@ class App:
 
     def update_ytdlp_worker(self, proxy):
         q = self.q
+        changed = False
         try:
-            q.put(("status", "Checking yt-dlp..."))
-            if update_ytdlp_lib(proxy, lambda m, t="text": q.put(("log", m, t))):
-                q.put(("ask_restart", "yt-dlp was updated."))
+            q.put(("status", "Checking packages..."))
+            changed = update_ytdlp_lib(proxy, lambda m, t="text": q.put(("log", m, t)))
         except Exception as e:
             q.put(("log", f"Update failed: {clean(e)}", "err"))
+        q.put(("log", "Checking for a newer app (ffmpeg, Deno and curl_cffi come with it)...", "dim"))
+        offered = self.update_check_worker(proxy, False)  # sends update_done itself unless it offers an update
+        if changed and not offered:
+            q.put(("ask_restart", "yt-dlp was updated."))
         q.put(("status", "Ready"))
-        q.put(("update_done",))
 
     def auto_check(self):
         if FROZEN and REPO and not self.busy and not self.updating:
@@ -1238,6 +1284,7 @@ class App:
             sums = next((a for a in rel.get("assets", []) if a.get("name") == "SHA256SUMS.txt"), None)
             q.put(("ask_update", tag, asset["browser_download_url"], int(asset.get("size") or 0),
                    asset["name"], sums["browser_download_url"] if sums else ""))
+            return True
         except Exception as e:
             if not silent:
                 q.put(("log", f"Update check failed: {clean(e)}", "err"))
@@ -1529,6 +1576,8 @@ def main():
         except Exception:
             pass
     root = tk.Tk()
+    for cls in ("Entry", "Text"):
+        root.bind_class(cls, "<Control-KeyPress>", ctrl_shortcut, add="+")
     try:
         SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
     except Exception:
