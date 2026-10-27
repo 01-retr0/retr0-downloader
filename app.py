@@ -785,6 +785,9 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
         opts["ffmpeg_location"] = ff
     if cookies:
         opts["cookiesfrombrowser"] = cookies
+        # The forced client list (tv, android_vr, android) ignores cookies or needs PO tokens, and
+        # skipping the webpage hides the login state. With cookies, let yt-dlp choose its own clients.
+        opts["extractor_args"].pop("youtube", None)
     if proxy:
         opts["proxy"] = proxy
 
@@ -1701,7 +1704,13 @@ class App:
                                     L(f"Trying YouTube cookies from detected browser profile: {label}", "warn")
                                 else:
                                     # Every detected profile was tried; surface the failure.
+                                    L("All detected cookie profiles were tried. Sign in to YouTube in that "
+                                      "browser, or turn the proxy on (your IP may be flagged).", "warn")
                                     raise
+                            elif is_youtube and auth_challenge:
+                                L("No browser cookie profile found. Select the browser and profile folder, "
+                                  "turn Cookies on, and sign in to YouTube there.", "warn")
+                                raise
                             elif use_imp and any(k in m for k in ("curl:", "http/2", "protocol_error", "stream")):
                                 L("Transport error. Retrying without browser impersonation.", "warn")
                                 use_imp = False
