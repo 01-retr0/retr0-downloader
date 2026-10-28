@@ -118,13 +118,17 @@ def set_window_icon(root) -> None:
     """Windows only: use icon.ico (bundled next to the exe) for the title bar and taskbar."""
     if not IS_WIN:
         return
-    try:
-        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-        ico = base / "icon.ico"
-        if ico.is_file():
-            root.iconbitmap(default=str(ico))
-    except Exception:
-        pass
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidates = [base / "icon.ico", Path(__file__).resolve().parent / "icon.ico"]
+    if FROZEN:
+        candidates.append(Path(sys.executable))  # the icon embedded in the exe itself
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                root.iconbitmap(default=str(cand))
+                return
+        except Exception:
+            continue
 
 
 def default_out_dir() -> Path:
@@ -1187,7 +1191,7 @@ class App:
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
         tk.Label(cf, text="Load your browser cookies, or leave the profile empty for the default location. "
                           "For YouTube, use Firefox.",
-                 fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(800),
+                 fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(600),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
 
         # Action buttons
