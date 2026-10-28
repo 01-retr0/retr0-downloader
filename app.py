@@ -114,6 +114,19 @@ def app_dir() -> Path:
     return base / "pydownload"
 
 
+def set_window_icon(root) -> None:
+    """Windows only: use icon.ico (bundled next to the exe) for the title bar and taskbar."""
+    if not IS_WIN:
+        return
+    try:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        ico = base / "icon.ico"
+        if ico.is_file():
+            root.iconbitmap(default=str(ico))
+    except Exception:
+        pass
+
+
 def default_out_dir() -> Path:
     return Path.home() / "Downloads" / "Retr0Downloader"
 
@@ -1038,6 +1051,7 @@ class App:
         self.updating = False
 
         root.title(APP_NAME)
+        set_window_icon(root)
         root.configure(bg=BG)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w, h = min(px(940), int(sw * 0.95)), min(px(780), int(sh * 0.92))
