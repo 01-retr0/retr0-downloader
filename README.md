@@ -41,6 +41,7 @@ Some antivirus programs may flag this app as a trojan or a virus. This is a fals
 
 - Works with almost any site that has a video, not only YouTube
 - Highest quality video and audio, merged into one file
+- Audio-only mode: turn on **Audio only (MP3)** to save just the sound as a 320 kbps MP3 (the highest quality MP3 allows). It works with single links, playlists and `.txt` files, and the setting is remembered
 - Paste the link of a page, a YouTube playlist, or a `.txt` file with one link per line
 - Choose where files are saved, with Browse and Open buttons
 - Optional proxy (`host:port` or `socks5://host:port`)
