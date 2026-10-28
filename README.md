@@ -67,3 +67,7 @@ Only download content you own or have permission to download, and follow the ter
     python app.py
 
 Needs Python 3.10 or newer. On Linux also install tkinter: `sudo apt install python3-tk`.
+
+## License
+
+Released under the [GNU General Public License v3.0](LICENSE). You can use, modify and share this app, but if you distribute a modified version you must also release its source code under the same license.
