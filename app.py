@@ -144,18 +144,21 @@ CAN_SELF_UPDATE = IS_WIN or IS_LINUX
 # ======================================
 # Theme
 # ======================================
-BG = "#07070d"
-BG2 = "#05050a"
-PANEL = "#0b0b14"
-LINE = "#1f2937"
-TEXT = "#e2e8f0"
-DIM = "#64748b"
-GREEN = "#00ff9c"
-GREEN_HI = "#5cffc4"
-CYAN = "#00e5ff"
-PINK = "#ff2d6f"
-YELLOW = "#facc15"
-GRADIENT = ["#00ff9c", "#00f0c8", "#00e5ff", "#00b8ff", "#7a5cff", "#ff2d6f", "#ff2d6f"]
+BG = "#0f1115"
+BG2 = "#0b0d11"
+PANEL = "#171a21"
+LINE = "#272c37"
+TEXT = "#e6e8ee"
+DIM = "#8a93a6"
+ACCENT = "#6c8cff"
+ACCENT_HI = "#8fa8ff"
+ACCENT_DK = "#1e2a52"
+GREEN = "#4ade80"
+GREEN_HI = "#86efac"
+CYAN = "#93a8ff"
+PINK = "#f87171"
+YELLOW = "#fbbf24"
+GRADIENT = ["#8fa8ff", "#8a9cff", "#8590ff", "#8184fb", "#7c78f5", "#7770ee", "#7268e6"]
 
 SCALE = 1.0
 
@@ -1268,8 +1271,8 @@ class Toggle(tk.Canvas):
         self.delete("all")
         w, h, m = self.w, self.h, px(3)
         on = self.value
-        track = "#003d26" if on else PANEL
-        edge = GREEN if on else LINE
+        track = ACCENT_DK if on else PANEL
+        edge = ACCENT if on else LINE
         self.create_oval(1, 1, h - 1, h - 1, fill=track, outline=edge)
         self.create_oval(w - h + 1, 1, w - 1, h - 1, fill=track, outline=edge)
         self.create_rectangle(h // 2, 1, w - h // 2, h - 1, fill=track, outline=track)
@@ -1277,7 +1280,7 @@ class Toggle(tk.Canvas):
         self.create_line(h // 2, h - 1, w - h // 2, h - 1, fill=edge)
         k = h - 2 * m
         x = w - m - k if on else m
-        self.create_oval(x, m, x + k, m + k, fill=GREEN if on else "#475569", outline="")
+        self.create_oval(x, m, x + k, m + k, fill=ACCENT if on else "#475569", outline="")
 
 
 class Bar(tk.Canvas):
@@ -1294,103 +1297,7 @@ class Bar(tk.Canvas):
         self.delete("all")
         w = self.winfo_width()
         if self.pct > 0:
-            self.create_rectangle(0, 0, int(w * self.pct / 100), self.winfo_height(), fill=GREEN, outline="")
-
-
-# ======================================
-# Splash screen (pixel-art banner, drawn with rectangles so it needs no special font)
-# ======================================
-GLYPHS = {
-    "R": ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
-    "E": ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
-    "T": ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
-    "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
-}
-WORD = "RETR0"
-
-
-class Splash(tk.Canvas):
-    def __init__(self, app, boot_lines):
-        super().__init__(app.root, bg=BG2, highlightthickness=0)
-        self.app = app
-        self.lines = boot_lines
-        self.frame = 0
-        self.finished = False
-        self.place(x=0, y=0, relwidth=1, relheight=1)
-        self.tk.call("raise", self._w)  # Canvas.lift() means tag_raise, so raise the widget directly
-        self.focus_set()
-        self.bind("<Button-1>", self.finish)
-        self.bind("<Key>", self.finish)
-        self.after(50, self.tick)
-
-    def tick(self):
-        if self.finished:
-            return
-        self.draw()
-        self.frame += 1
-        if self.frame >= 80:
-            self.finish()
-        else:
-            self.after(50, self.tick)
-
-    def draw(self):
-        self.delete("all")
-        w = max(self.winfo_width(), 200)
-        h = max(self.winfo_height(), 200)
-        cols = len(WORD) * 5 + (len(WORD) - 1)
-        cell = max(4, min(int(w * 0.66 / cols), px(16)))
-        block_h = 7 * cell + px(210)
-        y0 = max(px(16), (h - block_h) // 2)
-        x0 = (w - cols * cell) // 2
-        glitch = self.frame < 26
-
-        for r in range(7):
-            color = GRADIENT[r]
-            dx = 0
-            if glitch and random.random() < 0.35:
-                dx = random.randint(-3, 3) * max(1, cell // 2)
-                color = random.choice([PINK, CYAN, "#ffffff"])
-            x = x0
-            for ch in WORD:
-                row = GLYPHS[ch][r]
-                for c, bit in enumerate(row):
-                    if bit == "#":
-                        if glitch and random.random() < 0.03:
-                            continue
-                        px0 = x + c * cell + dx
-                        py0 = y0 + r * cell
-                        self.create_rectangle(px0, py0, px0 + cell - 1, py0 + cell - 1,
-                                              fill=color, outline="")
-                x += 6 * cell
-        if glitch:
-            for _ in range(8):
-                nx = x0 + random.randint(-cell * 3, cols * cell + cell * 3)
-                ny = y0 + random.randint(-cell, 8 * cell)
-                self.create_rectangle(nx, ny, nx + random.randint(cell, cell * 3), ny + max(2, cell // 4),
-                                      fill=random.choice([PINK, CYAN, GREEN]), outline="")
-
-        ty = y0 + 7 * cell + px(34)
-
-        shown = max(0, (self.frame - 12) // 5)
-        left = w // 2 - px(190)
-        for i, (ok, msg) in enumerate(self.lines[:shown]):
-            yy = ty + px(40) + i * px(22)
-            self.create_text(left, yy, text="[+]" if ok else "[!]", fill=GREEN if ok else PINK,
-                             anchor="w", font=self.app.f_bold)
-            self.create_text(left + px(40), yy, text=msg, fill="#94a3b8" if ok else PINK,
-                             anchor="w", font=self.app.f_mono)
-        if self.frame > 44:
-            self.create_text(w // 2, ty + px(40) + len(self.lines) * px(22) + px(26),
-                             text="Created By Retr0", fill=CYAN, font=self.app.f_title)
-        self.create_text(w // 2, h - px(20), text="click or press any key to skip", fill="#475569",
-                         font=self.app.f_mono)
-
-    def finish(self, _e=None):
-        if self.finished:
-            return
-        self.finished = True
-        self.destroy()
-        self.app.url_entry.focus_set()
+            self.create_rectangle(0, 0, int(w * self.pct / 100), self.winfo_height(), fill=ACCENT, outline="")
 
 
 # ======================================
@@ -1428,7 +1335,7 @@ class App:
         ytv = getattr(getattr(yt_dlp, "version", None), "__version__", "?")
         self.write(f"App version: {VERSION}    yt-dlp: {ytv}", "dim")
 
-        Splash(self, self.boot_lines())
+        self.url_entry.focus_set()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(40, self.poll)
         root.after(6000, self.auto_check)
@@ -1438,9 +1345,12 @@ class App:
         fams = set(tkfont.families())
         mono = next((f for f in ("Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono",
                                  "Liberation Mono", "Courier New") if f in fams), "TkFixedFont")
-        self.f_mono = tkfont.Font(family=mono, size=10)
-        self.f_bold = tkfont.Font(family=mono, size=10, weight="bold")
-        self.f_title = tkfont.Font(family=mono, size=12, weight="bold")
+        sans = next((f for f in ("Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue", "Ubuntu",
+                                 "Noto Sans", "DejaVu Sans", "Arial") if f in fams), "TkDefaultFont")
+        self.f_mono = tkfont.Font(family=sans, size=10)
+        self.f_bold = tkfont.Font(family=sans, size=10, weight="bold")
+        self.f_title = tkfont.Font(family=sans, size=13, weight="bold")
+        self.f_log = tkfont.Font(family=mono, size=10)
 
     def setup_styles(self):
         st = ttk.Style(self.root)
@@ -1454,20 +1364,20 @@ class App:
         st.map("Neon.TCombobox",
                fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)],
                selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", TEXT)],
-               bordercolor=[("focus", GREEN)])
+               bordercolor=[("focus", ACCENT)])
         st.configure("Neon.Vertical.TScrollbar", background=LINE, troughcolor=BG2, bordercolor=BG2,
                      arrowcolor=CYAN, lightcolor=LINE, darkcolor=LINE)
         self.root.option_add("*TCombobox*Listbox.background", PANEL)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", GREEN)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", BG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
         self.root.option_add("*TCombobox*Listbox.font", self.f_mono)
 
     def entry(self, parent, var):
         return tk.Entry(
-            parent, textvariable=var, bg=PANEL, fg=TEXT, insertbackground=GREEN,
-            relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=GREEN,
-            selectbackground="#164e3a", selectforeground=TEXT, font=self.f_mono,
+            parent, textvariable=var, bg=PANEL, fg=TEXT, insertbackground=ACCENT_HI,
+            relief="flat", highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT,
+            selectbackground=ACCENT_DK, selectforeground=TEXT, font=self.f_mono,
         )
 
     def label(self, parent, text, fg=CYAN):
@@ -1477,11 +1387,11 @@ class App:
         pad = px(24)
         top = tk.Frame(self.root, bg=PANEL)
         top.pack(fill="x")
-        tk.Label(top, text="RETR0 // Highest-Quality Video Downloader", fg=GREEN, bg=PANEL,
+        tk.Label(top, text="RETR0 // Highest-Quality Video Downloader", fg=TEXT, bg=PANEL,
                  font=self.f_title).pack(side="left", padx=pad, pady=px(14))
-        tk.Label(top, text=f"Created By Retr0   {VERSION}", fg=PINK, bg=PANEL,
+        tk.Label(top, text=f"Created By Retr0   {VERSION}", fg=DIM, bg=PANEL,
                  font=self.f_bold).pack(side="right", padx=pad)
-        tk.Frame(self.root, bg=GREEN, height=2).pack(fill="x")
+        tk.Frame(self.root, bg=LINE, height=1).pack(fill="x")
 
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill="both", expand=True, padx=pad, pady=px(16))
@@ -1558,10 +1468,10 @@ class App:
         left.pack(side="left")
         right = tk.Frame(bf, bg=BG)
         right.pack(side="right")
-        self.btn_go = Btn(left, "DOWNLOAD", self.start_download, BG, bg=GREEN, border=GREEN,
-                          hover_bg=GREEN_HI, hover_fg=BG, font=self.f_bold)
+        self.btn_go = Btn(left, "DOWNLOAD", self.start_download, "#ffffff", bg=ACCENT, border=ACCENT,
+                          hover_bg=ACCENT_HI, hover_fg="#ffffff", font=self.f_bold)
         self.btn_go.pack(side="left", padx=(0, px(10)))
-        self.btn_stop = Btn(left, "Stop", self.stop, PINK, bg="#1a0a12", hover_fg=BG, font=self.f_bold)
+        self.btn_stop = Btn(left, "Stop", self.stop, PINK, bg="#2a1618", hover_fg=BG, font=self.f_bold)
         self.btn_stop.pack(side="left", padx=(0, px(10)))
         self.btn_stop.set_enabled(False)
         Btn(left, "Clear", self.clear_log, CYAN, font=self.f_bold).pack(side="left")
@@ -1580,14 +1490,14 @@ class App:
         self.bar.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(px(4), px(12)))
 
         # Log
-        lf = tk.Frame(body, bg=BG2, highlightthickness=1, highlightbackground=PINK,
-                      highlightcolor=PINK)
+        lf = tk.Frame(body, bg=BG2, highlightthickness=1, highlightbackground=LINE,
+                      highlightcolor=LINE)
         lf.grid(row=8, column=0, columnspan=4, sticky="nsew")
         lf.rowconfigure(0, weight=1)
         lf.columnconfigure(0, weight=1)
-        self.log = tk.Text(lf, bg=BG2, fg="#94a3b8", relief="flat", wrap="word", font=self.f_mono,
+        self.log = tk.Text(lf, bg=BG2, fg="#94a3b8", relief="flat", wrap="word", font=self.f_log,
                            padx=px(10), pady=px(8), state="disabled", highlightthickness=0,
-                           cursor="arrow", selectbackground="#164e3a")
+                           cursor="arrow", selectbackground=ACCENT_DK)
         self.log.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview,
                            style="Neon.Vertical.TScrollbar")
@@ -1597,17 +1507,6 @@ class App:
                            ("dim", DIM), ("pink", PINK), ("text", "#cbd5e1")):
             self.log.tag_configure(tag, foreground=color)
         self.log.tag_configure("head", foreground=CYAN, font=self.f_bold)
-
-    def boot_lines(self):
-        ff, dn = find_ffmpeg(), find_deno()
-        return [
-            (True, f"tunnel layer ...... {platform.system().lower()}"),
-            (bool(ff), "ffmpeg ............ " + ("online" if ff else "MISSING")),
-            (bool(dn), "js runtime ........ " + ("online" if dn else "MISSING")),
-            (True, "proxy route ....... " + (redact_proxy(self.cfg["proxy"]) if self.cfg["use_proxy"] else "direct")),
-            (True, "cookie jar ........ " + (self.cfg["browser"] if self.cfg["use_cookies"] else "off")),
-            (True, "handshake complete"),
-        ]
 
     # ---------- small actions ----------
     def on_browser(self, _e=None):
