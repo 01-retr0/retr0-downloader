@@ -11,6 +11,7 @@ import queue
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -42,7 +43,61 @@ except Exception:
 _BASE = (Path(os.environ.get("APPDATA", Path.home())) if platform.system() == "Windows"
          else Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")))
 LIB_DIR = _BASE / "pydownload" / "lib"
+
+
+def _rm_path(p: Path) -> None:
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists() or p.is_symlink():
+            p.unlink()
+    except OSError:
+        pass
+
+
+def _rollback_lib(new: list, old: list) -> None:
+    """Undo a half-finished package install: drop the new files, put the old ones back."""
+    backup = LIB_DIR / ".backup"
+    for n in new:
+        if n in old and not (backup / n).exists():
+            continue  # the old copy was never moved away, so it is still in place
+        _rm_path(LIB_DIR / n)
+    for n in old:
+        src = backup / n
+        if src.exists() or src.is_symlink():
+            _rm_path(LIB_DIR / n)
+            shutil.move(str(src), str(LIB_DIR / n))
+
+
+def _early_log(msg: str) -> None:
+    """debug_log() is defined further down; this one is safe to call while the module is importing."""
+    try:
+        LIB_DIR.parent.mkdir(parents=True, exist_ok=True)
+        with (LIB_DIR.parent / "debug.log").open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _recover_lib() -> None:
+    """If the app was closed in the middle of a package install, roll that install back."""
+    journal = LIB_DIR / ".journal.json"
+    try:
+        if journal.exists():
+            data = json.loads(journal.read_text(encoding="utf-8"))
+            safe = lambda key: [n for n in data.get(key, []) if n and Path(n).name == n]  # noqa: E731
+            _rollback_lib(safe("new"), safe("old"))
+            journal.unlink()
+        shutil.rmtree(LIB_DIR / ".backup", ignore_errors=True)
+        shutil.rmtree(LIB_DIR / ".tmp", ignore_errors=True)
+    except Exception as e:
+        # The old packages cannot be restored: drop them so the bundled copy is used.
+        _early_log(f"_recover_lib: rollback failed, downloaded packages removed: {e}")
+        shutil.rmtree(LIB_DIR, ignore_errors=True)
+
+
 if getattr(sys, "frozen", False):
+    _recover_lib()
     try:
         _marker = LIB_DIR / ".for_app"
         if LIB_DIR.exists() and (not _marker.exists() or _marker.read_text().strip() != VERSION):
@@ -55,8 +110,9 @@ if getattr(sys, "frozen", False):
 try:
     import yt_dlp
     import yt_dlp.version  # noqa: F401
-except Exception:
+except Exception as _imp_err:
     # A broken downloaded package must never stop the app: drop it and use the bundled copy.
+    _early_log(f"downloaded packages failed to import and were removed: {_imp_err}")
     shutil.rmtree(LIB_DIR, ignore_errors=True)
     sys.path[:] = [x for x in sys.path if x != str(LIB_DIR)]
     for _m in list(sys.modules):
@@ -81,6 +137,9 @@ if sys.platform.startswith("linux"):
     PIP_PACKAGES.append("secretstorage")
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
+IS_LINUX = sys.platform.startswith("linux")
+# Release builds exist only for Windows (.exe) and Linux (*-linux).
+CAN_SELF_UPDATE = IS_WIN or IS_LINUX
 
 # ======================================
 # Theme
@@ -116,6 +175,86 @@ def app_dir() -> Path:
     return base / "pydownload"
 
 
+_SAFE_QUERY_KEYS = {"v", "list", "t", "index", "id"}
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>)\]]+", re.I)
+_CREDS_RE = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/\s?#]*@", re.I)
+
+
+def _redact_url(m) -> str:
+    s = m.group(0)
+    trail = ""
+    while s and s[-1] in ".,;:":
+        trail = s[-1] + trail
+        s = s[:-1]
+    s = _CREDS_RE.sub(r"\1***@", s)  # user:password@host
+    s = s.partition("#")[0]  # fragments can carry tokens
+    base, sep, query = s.partition("?")
+    if sep and query:
+        parts = []
+        for p in query.split("&"):
+            k, eq, _ = p.partition("=")
+            if eq and k.lower() in _SAFE_QUERY_KEYS:
+                parts.append(p)
+            else:
+                parts.append(f"{k}=***" if eq else "***")
+        s = base + "?" + "&".join(parts)
+    return s + trail
+
+
+_BARE_CREDS_RE = re.compile(r"(?<![\w/@.%+-])[\w.%+-]+:[^\s/@:]+@(?=[\w.-])")  # user:pass@host
+_AUTH_HEADER_RE = re.compile(
+    r"\b(proxy-authorization|authorization|set-cookie|cookie|x-api-key)(\s*[:=]\s*)[^\r\n]*", re.I)
+_BEARER_RE = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
+_SECRET_KV_RE = re.compile(
+    r"\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"session[_-]?id|sessionid)(\s*[=:]\s*)[^\s&\"',;]+", re.I)
+
+
+def _home_variants() -> list:
+    try:
+        home = str(Path.home())
+    except Exception:
+        return []
+    if len(home) < 4:
+        return []
+    forms = {home, home.replace("\\", "/"), home.replace("/", "\\"), home.replace("\\", "\\\\")}
+    return sorted(forms, key=len, reverse=True)
+
+
+def redact(text) -> str:
+    """Hide credentials and personal data before text is shown or saved: proxy passwords, tokens and
+    signed-URL parameters, auth headers, password=/token= pairs, and the home folder (shown as ~).
+    Only a few harmless query keys (v, list, t, index, id) are kept so links stay recognisable.
+    This is best-effort: a secret inside a URL path cannot be recognised."""
+    s = _URL_RE.sub(_redact_url, str(text))
+    s = _BARE_CREDS_RE.sub("***@", s)
+    s = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + m.group(2) + "***", s)
+    s = _BEARER_RE.sub("Bearer ***", s)
+    s = _SECRET_KV_RE.sub(lambda m: m.group(1) + m.group(2) + "***", s)
+    for v in _home_variants():
+        s = re.sub(re.escape(v) + r"(?![\w-])", "~", s, flags=re.I if IS_WIN else 0)
+    return s
+
+
+def redact_proxy(addr: str) -> str:
+    """A proxy address without credentials (host:port stays as the user typed it)."""
+    addr = str(addr)
+    if "://" in addr:
+        return redact(addr)
+    return redact("x://" + addr)[4:]
+
+
+def debug_log(msg: str) -> None:
+    """Append a line to debug.log instead of silently swallowing an error."""
+    try:
+        d = app_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        with (d / "debug.log").open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {redact(msg)}\n")
+    except Exception:
+        pass
+
+
 def set_window_icon(root) -> None:
     """Windows only: use icon.ico (bundled next to the exe) for the title bar and taskbar."""
     if not IS_WIN:
@@ -129,7 +268,8 @@ def set_window_icon(root) -> None:
             if cand.is_file():
                 root.iconbitmap(default=str(cand))
                 return
-        except Exception:
+        except Exception as e:
+            debug_log(f"icon {cand}: {e}")
             continue
 
 
@@ -216,12 +356,12 @@ def _profiles_under(root: Path, browser_kind: str) -> list:
                         if not rel:
                             continue
                         is_relative = parser.getboolean(section, "IsRelative", fallback=True)
-                        base = ini.parent if is_relative else Path("/")
-                        profile = (base / rel).expanduser() if is_relative else Path(rel).expanduser()
+                        profile = (ini.parent / rel) if is_relative else Path(rel)
+                        profile = profile.expanduser()
                         if (profile / "cookies.sqlite").is_file():
                             found.append(profile)
-                except (OSError, configparser.Error, ValueError):
-                    pass
+                except (OSError, configparser.Error, ValueError) as e:
+                    debug_log(f"profiles.ini {ini}: {e}")
             if (root / "cookies.sqlite").is_file():
                 found.append(root)
             for db in root.glob("*/cookies.sqlite"):
@@ -234,14 +374,16 @@ def _profiles_under(root: Path, browser_kind: str) -> list:
                     continue
                 if (profile / "Network/Cookies").is_file() or (profile / "Cookies").is_file():
                     found.append(profile)
-    except OSError:
-        pass
+    except OSError as e:
+        debug_log(f"profiles under {root}: {e}")
     # Keep order, remove duplicates.
     return list(dict.fromkeys(found))
 
 
-def detect_browser_cookie_sources(preferred_browser="", preferred_profile="") -> list:
-    """Return ordered yt-dlp browser-cookie tuples for profiles found on this PC."""
+def detect_browser_cookie_sources(preferred_browser="", preferred_profile="", all_browsers=False) -> list:
+    """Return ordered yt-dlp browser-cookie tuples for profiles found on this PC.
+    By default only profiles of the browser the user selected are returned. Cookies of the
+    other browsers are included only when all_browsers is True (an explicit opt-in)."""
     sources = []
     seen = set()
 
@@ -258,7 +400,8 @@ def detect_browser_cookie_sources(preferred_browser="", preferred_profile="") ->
         add(preferred_browser, preferred_profile)
     roots = browser_profile_roots()
     order = [preferred_browser] if preferred_browser in BROWSERS else []
-    order += [b for b in BROWSERS if b not in order]
+    if all_browsers:
+        order += [b for b in BROWSERS if b not in order]
     for browser in order:
         for root in roots.get(browser, []):
             for profile in _profiles_under(root, "firefox" if browser == "firefox" else "chromium"):
@@ -272,14 +415,17 @@ def load_settings() -> dict:
         "proxy": "127.0.0.1:10808",
         "use_proxy": False,
         "use_cookies": False,
+        "cookie_all_browsers": False,
         "browser": "opera",
         "profile": default_profile(),
     }
     try:
         with (app_dir() / "settings.json").open("r", encoding="utf-8") as f:
             cfg.update(json.load(f))
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        debug_log(f"load_settings: {e}")
     return cfg
 
 
@@ -289,8 +435,8 @@ def save_settings(cfg: dict) -> None:
         d.mkdir(parents=True, exist_ok=True)
         with (d / "settings.json").open("w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"save_settings: {e}")
 
 
 def normalize_proxy(addr: str) -> str:
@@ -330,9 +476,11 @@ def find_deno() -> str:
     if found:
         return found
     # The build bundles the binary in deno_bin/: a plain "deno" file would clash with the deno/ package folder.
-    bundled = Path(getattr(sys, "_MEIPASS", "")) / "deno_bin" / ("deno.exe" if IS_WIN else "deno")
-    if bundled.exists():
-        return str(bundled)
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        bundled = Path(meipass) / "deno_bin" / ("deno.exe" if IS_WIN else "deno")
+        if bundled.exists():
+            return str(bundled)
     try:
         import deno
         return str(deno.find_deno_bin())
@@ -364,7 +512,8 @@ def open_folder(path: Path) -> bool:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=host_env(),
             )
         return True
-    except Exception:
+    except Exception as e:
+        debug_log(f"open_folder: {e}")
         return False
 
 
@@ -375,11 +524,67 @@ def clean(msg: str) -> str:
     return _ANSI.sub("", str(msg))
 
 
+_RATE_HINTS = ("rate-limit", "rate limit", "too many requests", "http error 429")
+_LOGIN_HINTS = ("login", "log in", "sign in", "authentication", "not a bot")
+_NET_HINTS = ("timed out", "timeout", "curl: (28)", "curl: (6)", "curl: (7)", "could not resolve",
+              "name or service not known", "network is unreachable", "connection refused",
+              "connection reset", "unable to connect to proxy", "proxyerror")
+
+
+def classify_error(msg: str) -> str:
+    """'rate', 'login', 'rate_login' (the site cannot tell which), 'network', 'ffmpeg' or ''."""
+    low = clean(msg).lower()
+    rate = any(k in low for k in _RATE_HINTS)
+    login = any(k in low for k in _LOGIN_HINTS)
+    if rate and login:
+        return "rate_login"
+    if rate:
+        return "rate"
+    if login:
+        return "login"
+    if any(k in low for k in _NET_HINTS):
+        return "network"
+    if "ffmpeg" in low:
+        return "ffmpeg"
+    return ""
+
+
+def error_hint(msg: str) -> str:
+    return {
+        "rate": "Rate limit. Wait a while (sometimes up to an hour) or change the proxy/IP, then try again.",
+        "login": "Login required. Turn Cookies on and make sure you are signed in within that browser.",
+        "rate_login": "Rate limit or login required. Sign in within the browser and turn Cookies on; "
+                      "if it still fails, wait a while and try again.",
+        "network": "Network error. Check your internet connection, the proxy address and port, "
+                   "and that the site is reachable.",
+        "ffmpeg": "FFmpeg is missing or not working.",
+    }.get(classify_error(msg), "")
+
+
 # ======================================
 # Update helpers
 # ======================================
+# Pre-release stages in order: dev < alpha < beta < release candidate < final release.
+_STAGE_RANK = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2, "c": 3, "rc": 3, "pre": 3, "preview": 3}
+_STAGE_RE = re.compile(r"[-_.]?(preview|alpha|beta|dev|pre|rc|a|b|c)(?![a-z])[-_.]?(\d*)", re.I)
+_FINAL = max(_STAGE_RANK.values()) + 1
+
+
 def version_tuple(v) -> tuple:
-    return tuple(int(n) for n in re.findall(r"\d+", str(v)))
+    """Comparable version key: (numbers, stage, stage number). 1.2.3-beta2 < 1.2.3-rc1 < 1.2.3,
+    trailing zeros are ignored (1.2 == 1.2.0), a leading v and +build metadata do not matter."""
+    s = str(v).strip().lstrip("vV")
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)$", s, re.S)
+    if not m:
+        return ((), _FINAL, 0)
+    nums = [int(n) for n in m.group(1).split(".")]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    rest = m.group(2).split("+", 1)[0]
+    st = _STAGE_RE.match(rest)
+    if not st:
+        return (tuple(nums), _FINAL, 0)
+    return (tuple(nums), _STAGE_RANK[st.group(1).lower()], int(st.group(2) or 0))
 
 
 def _sidecar(exe: Path, ext: str) -> Path:
@@ -394,17 +599,18 @@ def cleanup_old_exe() -> None:
         for ext in (".old", ".new"):
             try:
                 _sidecar(exe, ext).unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as e:
+                debug_log(f"cleanup {ext}: {e}")
 
 
 def pick_release_asset(assets) -> dict | None:
-    """The release file for this OS: the .exe on Windows, the *-linux binary on Linux."""
+    """The release file for this OS: the .exe on Windows, the *-linux binary on Linux.
+    Other systems (macOS) have no build."""
     for a in assets or []:
         n = str(a.get("name", "")).lower()
         if IS_WIN and n.endswith(".exe"):
             return a
-        if not IS_WIN and n.endswith("-linux"):
+        if IS_LINUX and n.endswith("-linux"):
             return a
     return None
 
@@ -454,28 +660,46 @@ def fetch_latest_release(proxy: str) -> dict:
         with _http_ydl(proxy) as ydl:
             resp = ydl.urlopen(Request(url, headers={
                 "Accept": "application/vnd.github+json", "User-Agent": "Retr0Downloader"}))
-            return json.loads(resp.read().decode("utf-8"))
+            try:
+                return json.loads(resp.read().decode("utf-8"))
+            finally:
+                resp.close()
     except Exception as e:
         if "404" in str(e):
             raise RuntimeError("No release found. The repository must be public and have a release.") from e
         raise
 
 
-def download_asset(url: str, dest: Path, proxy: str, progress) -> None:
+MAX_WHEEL_DOWNLOAD = 100 * 1024 * 1024  # a package download larger than this is refused
+MAX_SUMS_DOWNLOAD = 1024 * 1024  # SHA256SUMS.txt is a few lines
+MAX_APP_DOWNLOAD = 600 * 1024 * 1024  # used only when the release does not report the file size
+
+
+def download_asset(url: str, dest: Path, proxy: str, progress, max_bytes: int = 0) -> None:
+    """Download the new program. The transfer is refused as soon as the server announces more than
+    max_bytes (or MAX_APP_DOWNLOAD), or when more than that has actually arrived."""
     from yt_dlp.networking import Request
+    limit = max_bytes or MAX_APP_DOWNLOAD
     with _http_ydl(proxy) as ydl:
         resp = ydl.urlopen(Request(url, headers={
             "User-Agent": "Retr0Downloader", "Accept": "application/octet-stream"}))
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        with dest.open("wb") as f:
-            while True:
-                chunk = resp.read(262144)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                progress(done, total)
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+            if total > limit:
+                raise RuntimeError("The download is larger than expected, aborted.")
+            done = 0
+            with dest.open("wb") as f:
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    if done > limit:
+                        raise RuntimeError("The download is larger than expected, aborted.")
+                    f.write(chunk)
+                    progress(done, total)
+        finally:
+            resp.close()
     if total and done != total:
         raise RuntimeError("The download was incomplete.")
     magic, name = (b"MZ", "Windows") if IS_WIN else (b"\x7fELF", "Linux")
@@ -539,61 +763,165 @@ def _pick_wheel(files) -> dict | None:
     return None
 
 
-def _install_wheel(entry: dict, proxy: str) -> None:
-    """Download a pure-Python wheel from PyPI, verify its sha256 and unpack it into LIB_DIR."""
+MAX_UNPACKED = 300 * 1024 * 1024  # refuse a package that unpacks to more than this
+
+
+def _stage_wheel(entry: dict, proxy: str, tmp: Path, n: int) -> tuple:
+    """Download a pure-Python wheel from PyPI, verify its sha256, unpack it into tmp/stage<n> and
+    validate it. Returns (stage_dir, top_level_names). Nothing in LIB_DIR is touched."""
+    whl = tmp / f"{n}_{Path(entry['filename']).name}"
+    size = int(entry.get("size") or 0)  # PyPI reports each file's size
+    if size > MAX_WHEEL_DOWNLOAD:
+        raise RuntimeError("The package is larger than expected, aborted.")
+    download_asset_raw(entry["url"], whl, proxy, max_bytes=size or MAX_WHEEL_DOWNLOAD)
+    want = (entry.get("digests") or {}).get("sha256")
+    if not want or sha256_file(whl) != want:
+        raise RuntimeError("Checksum mismatch, the download was discarded.")
+
+    stage = tmp / f"stage{n}"
+    stage.mkdir()
+    root = stage.resolve()
+    with zipfile.ZipFile(whl) as z:
+        if z.testzip() is not None:
+            raise RuntimeError("The package is corrupted, aborted.")
+        if sum(i.file_size for i in z.infolist()) > MAX_UNPACKED:
+            raise RuntimeError("The package unpacks to an unexpected size, aborted.")
+        for info in z.infolist():
+            target = (stage / info.filename).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError("Unsafe path inside the package, aborted.")
+            mode = info.external_attr >> 16
+            if mode and stat.S_ISLNK(mode):
+                raise RuntimeError("Symlink inside the package, aborted.")
+        z.extractall(stage)
+    names = [p.name for p in stage.iterdir() if not p.name.endswith(".data")]
+    has_meta = any(n_.endswith(".dist-info") for n_ in names)
+    has_code = any(
+        not n_.endswith(".dist-info")
+        and ((stage / n_).is_file() and n_.endswith(".py") or (stage / n_ / "__init__.py").is_file())
+        for n_ in names)
+    if not (has_meta and has_code):
+        raise RuntimeError("The package has an unexpected layout, aborted.")
+    return stage, names
+
+
+def _install_wheels(entries: list, proxy: str) -> None:
+    """Install one or more wheels into LIB_DIR as ONE all-or-nothing step. Every wheel is downloaded,
+    verified and validated first; only then are they all swapped in under a single journal, so an
+    error (or closing the app halfway) never leaves new and old packages mixed together."""
     LIB_DIR.mkdir(parents=True, exist_ok=True)
     tmp = LIB_DIR / ".tmp"
+    backup = LIB_DIR / ".backup"
+    journal = LIB_DIR / ".journal.json"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir()
     try:
-        whl = tmp / Path(entry["filename"]).name
-        download_asset_raw(entry["url"], whl, proxy)
-        want = (entry.get("digests") or {}).get("sha256")
-        if not want or sha256_file(whl) != want:
-            raise RuntimeError("Checksum mismatch, the download was discarded.")
-        stage = tmp / "stage"
-        stage.mkdir()
-        root = stage.resolve()
-        with zipfile.ZipFile(whl) as z:
-            for name in z.namelist():
-                target = (stage / name).resolve()
-                if target != root and root not in target.parents:
-                    raise RuntimeError("Unsafe path inside the package, aborted.")
-            z.extractall(stage)
-        for item in list(stage.iterdir()):
-            if item.name.endswith(".data"):
-                continue
-            if item.name.endswith(".dist-info"):
-                for stale in LIB_DIR.glob(item.name.split("-")[0] + "-*.dist-info"):
-                    shutil.rmtree(stale, ignore_errors=True)
-            dest = LIB_DIR / item.name
-            if dest.is_dir():
-                shutil.rmtree(dest)
-            elif dest.exists():
-                dest.unlink()
-            shutil.move(str(item), str(dest))
-        (LIB_DIR / ".for_app").write_text(VERSION)
+        # 1+2. Download, verify and unpack everything. Nothing in LIB_DIR is touched yet.
+        staged = [_stage_wheel(e, proxy, tmp, i) for i, e in enumerate(entries)]
+        names, stage_of = [], {}
+        for stage, ns in staged:
+            for n in ns:
+                if n in stage_of:
+                    raise RuntimeError("The packages overlap each other, aborted.")
+                stage_of[n] = stage
+                names.append(n)
+
+        # 3. Work out which existing files will be replaced.
+        old = []
+        for n in names:
+            if (LIB_DIR / n).exists() or (LIB_DIR / n).is_symlink():
+                old.append(n)
+            if n.endswith(".dist-info"):
+                for stale in LIB_DIR.glob(n.split("-")[0] + "-*.dist-info"):
+                    if stale.name not in old:
+                        old.append(stale.name)
+
+        # 4. Swap. The old files are moved to a backup folder first, and a journal lets the
+        # next start roll back if the app is closed halfway. Any error restores the old version.
+        shutil.rmtree(backup, ignore_errors=True)
+        backup.mkdir()
+        journal.write_text(json.dumps({"new": names, "old": old}), encoding="utf-8")
+        try:
+            for n in old:
+                shutil.move(str(LIB_DIR / n), str(backup / n))
+            for n in names:
+                shutil.move(str(stage_of[n] / n), str(LIB_DIR / n))
+            (LIB_DIR / ".for_app").write_text(VERSION)
+        except BaseException:
+            rolled_back = False
+            try:
+                _rollback_lib(names, old)
+                rolled_back = True
+            except Exception as rb:
+                # Keep the journal: the next start (_recover_lib) tries the rollback again and, if that
+                # fails too, falls back to the bundled copy. The original error is re-raised below.
+                debug_log(f"rollback failed, journal kept for recovery at next start: {rb}")
+            if rolled_back:
+                journal.unlink(missing_ok=True)
+                shutil.rmtree(backup, ignore_errors=True)
+            raise
+
+        # 5. Success: the journal goes first, so a crash here never triggers a rollback.
+        journal.unlink(missing_ok=True)
+        shutil.rmtree(backup, ignore_errors=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def download_asset_raw(url: str, dest: Path, proxy: str) -> None:
+def download_asset_raw(url: str, dest: Path, proxy: str, max_bytes: int = 0) -> None:
+    """Download url to dest. With max_bytes, the transfer is refused as soon as the server announces
+    more than that or more than that has arrived, and the partial file is removed."""
     from yt_dlp.networking import Request
-    with _http_ydl(proxy) as ydl:
-        resp = ydl.urlopen(Request(url, headers={"User-Agent": "Retr0Downloader"}))
+    dest = Path(dest)
+    try:
+        with _http_ydl(proxy) as ydl:
+            resp = ydl.urlopen(Request(url, headers={"User-Agent": "Retr0Downloader"}))
+            try:
+                if max_bytes and int(resp.headers.get("Content-Length") or 0) > max_bytes:
+                    raise RuntimeError("The download is larger than expected, aborted.")
+                done = 0
+                with dest.open("wb") as f:
+                    while True:
+                        chunk = resp.read(1 << 18)
+                        if not chunk:
+                            break
+                        done += len(chunk)
+                        if max_bytes and done > max_bytes:
+                            raise RuntimeError("The download is larger than expected, aborted.")
+                        f.write(chunk)
+            finally:
+                resp.close()
+    except BaseException:
         try:
-            with Path(dest).open("wb") as f:
-                while True:
-                    chunk = resp.read(1 << 18)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-        finally:
-            resp.close()
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _ejs_requirement(requires_dist):
+    """Find the yt-dlp-ejs requirement in yt-dlp's PyPI metadata (its Requires-Dist entries).
+    Returns the exact pinned version, or None if yt-dlp does not require yt-dlp-ejs at all.
+    Raises if it is required in any form that is not one exact pin (>=, ~=, ==0.3.*, a URL...):
+    this updater cannot install that safely, and a new yt-dlp without the matching yt-dlp-ejs
+    can break YouTube, so the update must stop instead of continuing without it."""
+    for req in requires_dist or []:
+        spec = str(req).split(";", 1)[0].strip()  # what follows ';' is an environment marker
+        m = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)$", spec)
+        if not m or re.sub(r"[-_.]+", "-", m.group(1)).lower() != "yt-dlp-ejs":
+            continue
+        rest = m.group(2).strip().strip("()").strip()
+        pin = re.fullmatch(r"==\s*([A-Za-z0-9][A-Za-z0-9._]*)", rest)
+        if pin:
+            return pin.group(1)
+        raise RuntimeError(f"yt-dlp requires yt-dlp-ejs ({rest or 'any version'}), which cannot be pinned "
+                           "to one exact version here. yt-dlp was not updated. Update the app instead.")
+    return None
 
 
 def update_ytdlp_lib(proxy: str, log) -> bool:
-    """Packaged app: fetch the latest yt-dlp (and its pinned yt-dlp-ejs) from PyPI into LIB_DIR.
+    """Packaged app: fetch the latest yt-dlp together with its pinned yt-dlp-ejs from PyPI into LIB_DIR.
+    Both are installed in one step: either both are updated or nothing changes.
     Returns True if something was installed (a restart is then needed)."""
     meta = _pypi_json("https://pypi.org/pypi/yt-dlp/json", proxy)
     latest = meta["info"]["version"]
@@ -608,16 +936,18 @@ def update_ytdlp_lib(proxy: str, log) -> bool:
     wheel = _pick_wheel(meta.get("urls"))
     if not wheel:
         raise RuntimeError("No installable package found for the latest yt-dlp.")
-    log(f"Updating yt-dlp {current} -> {latest} ...", "info")
-    _install_wheel(wheel, proxy)
-    for req in meta["info"].get("requires_dist") or []:
-        m = re.match(r"yt-dlp-ejs\s*==\s*([\w.]+)", req)
-        if m:
-            log(f"Updating yt-dlp-ejs {m[1]} ...", "info")
-            w = _pick_wheel(_pypi_json(f"https://pypi.org/pypi/yt-dlp-ejs/{m[1]}/json", proxy).get("urls"))
-            if w:
-                _install_wheel(w, proxy)
-            break
+    wheels = [wheel]
+    ejs_version = _ejs_requirement(meta["info"].get("requires_dist")) or ""
+    if ejs_version:
+        ejs = _pick_wheel(_pypi_json(f"https://pypi.org/pypi/yt-dlp-ejs/{ejs_version}/json", proxy).get("urls"))
+        if not ejs:
+            # yt-dlp needs exactly this yt-dlp-ejs; a new yt-dlp with an old one can break YouTube.
+            raise RuntimeError(f"No installable package found for yt-dlp-ejs {ejs_version}. "
+                               "Nothing was changed.")
+        wheels.append(ejs)
+    log(f"Updating yt-dlp {current} -> {latest}"
+        + (f" and yt-dlp-ejs {ejs_version}" if ejs_version else "") + " ...", "info")
+    _install_wheels(wheels, proxy)
     log(f"yt-dlp updated to {latest}.", "ok")
     return True
 
@@ -633,7 +963,8 @@ def linux_pick_folder(start: str):
         return None
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=host_env())
-    except Exception:
+    except Exception as e:
+        debug_log(f"linux_pick_folder: {e}")
         return None
     if r.returncode == 0:
         return r.stdout.strip()
@@ -709,16 +1040,13 @@ def fetch_playlist_links(url: str, proxy: str, cookies, fallback_cookies=None) -
             if not auth_or_cookie_error:
                 raise
             if ck:
-                # Continue through detected profiles; a later one may contain the valid login.
-                continue
+                continue  # a later profile may contain the valid login
             raise
     if info is None:
-        if last_error:
-            raise last_error
-        raise RuntimeError("Could not read playlist information")
+        raise last_error or RuntimeError("Could not read playlist information")
 
     links = []
-    for e in (info or {}).get("entries") or []:
+    for e in info.get("entries") or []:
         if not e:
             continue
         link = e.get("url") or e.get("webpage_url")
@@ -726,12 +1054,12 @@ def fetch_playlist_links(url: str, proxy: str, cookies, fallback_cookies=None) -
             link = f"https://www.youtube.com/watch?v={e['id']}"
         if link:
             links.append(link)
-    return (info or {}).get("title") or "playlist", links
+    return info.get("title") or "playlist", links
 
 
 def read_url_file(path: Path) -> list:
-    with path.open("r", encoding="utf-8") as f:
-        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    with path.open("r", encoding="utf-8-sig") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
 
 
 # ======================================
@@ -745,7 +1073,7 @@ class _SilentLogger:
 
 
 def download_video(url, out_dir, proxy, cookies, progress_callback=None,
-                   cancel_event=None, impersonate=True, retries=20):
+                   cancel_event=None, impersonate=True, retries=20, batch=False):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     rand = uuid.uuid4().hex[:8]
 
@@ -762,9 +1090,10 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
 
     opts = {
         "format": "bestvideo*+bestaudio/best",
-        "format_sort": ["res", "vcodec:av01", "vcodec:vp9.2", "vcodec:vp9", "fps", "br"],
+        # Resolution and fps first; prefer widely playable VP9 over AV1, then bitrate.
+        "format_sort": ["res", "fps", "vcodec:vp9.2", "vcodec:vp9", "br"],
         "merge_output_format": "mkv",
-        "outtmpl": str(out_dir / f"{timestamp}_{rand}_%(title)s.%(ext)s"),
+        "outtmpl": str(out_dir / f"{timestamp}_{rand}_%(title).150B.%(ext)s"),
         "noplaylist": True,
         "windowsfilenames": IS_WIN,
         "extractor_args": {
@@ -785,11 +1114,13 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
         "consoletitle": False,
         "logger": _SilentLogger(),
         "http_headers": headers,
-        "sleep_interval": 2,
-        "max_sleep_interval": 6,
         "concurrent_fragment_downloads": 3,
         "socket_timeout": 60,
     }
+    if batch:
+        # Pause between videos only when downloading many, to avoid rate limits.
+        opts["sleep_interval"] = 1
+        opts["max_sleep_interval"] = 3
 
     deno = find_deno()
     if deno:
@@ -814,8 +1145,10 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
         try:
             from yt_dlp.networking.impersonate import ImpersonateTarget
             opts["impersonate"] = ImpersonateTarget.from_str("chrome")
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log(f"impersonate unavailable: {e}")
+
+    finished_streams = [0]
 
     def hook(d):
         if cancel_event is not None and cancel_event.is_set():
@@ -827,7 +1160,12 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
             progress_callback(d.get("downloaded_bytes", 0), total,
                               clean(d.get("_speed_str") or "").strip(), d.get("eta"))
         elif d.get("status") == "finished":
-            progress_callback(None, None, None, None, finished=True)
+            # Video and audio are separate streams: only report "finished" (and start
+            # "Merging...") once the last of them has been downloaded.
+            expected = len((d.get("info_dict") or {}).get("requested_formats") or []) or 1
+            finished_streams[0] += 1
+            if finished_streams[0] >= expected:
+                progress_callback(None, None, None, None, finished=True)
 
     opts["progress_hooks"] = [hook]
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -850,7 +1188,7 @@ def ctrl_shortcut(e):
         return None
     w = e.widget
     if act == "a":
-        if isinstance(w, tk.Entry):
+        if isinstance(w, (tk.Entry, ttk.Entry)):
             w.select_range(0, "end")
             w.icursor("end")
         else:
@@ -1019,8 +1357,6 @@ class Splash(tk.Canvas):
                                       fill=random.choice([PINK, CYAN, GREEN]), outline="")
 
         ty = y0 + 7 * cell + px(34)
-        self.create_text(w // 2, ty, text="// ANONYMOUS DOWNLOAD TUNNEL //", fill=PINK,
-                         font=self.app.f_bold)
 
         shown = max(0, (self.frame - 12) // 5)
         left = w // 2 - px(190)
@@ -1055,6 +1391,7 @@ class App:
         self.cancel = threading.Event()
         self.busy = False
         self.updating = False
+        self.pending_restart = False  # yt-dlp was updated but the app has not been restarted yet
 
         root.title(APP_NAME)
         set_window_icon(root)
@@ -1191,10 +1528,15 @@ class App:
         self.entry(cf, self.var_profile).grid(row=0, column=2, sticky="ew", ipady=ipad)
         tk.Label(cf, text="profile folder (optional)", fg=DIM, bg=BG,
                  font=self.f_mono).grid(row=0, column=3, padx=(px(10), 0))
-        tk.Label(cf, text="Load your browser cookies, or leave the profile empty for the default location. "
-                          "For YouTube, use Firefox.",
+        tk.Label(cf, text="Only load cookies if a website requires login to download (common on YouTube); use a browser where you're already signed in. Firefox is recommended for YouTube.",
                  fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(600),
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
+        # Opt-in: by default only the selected browser's profiles are tried when a sign-in is needed.
+        self.sw_all_browsers = Toggle(cf, self.cfg.get("cookie_all_browsers", False))
+        self.sw_all_browsers.grid(row=2, column=0, padx=(0, px(12)), pady=(px(8), 0))
+        tk.Label(cf, text="If sign-in fails, automatically try cookies from other installed browsers",
+                 fg=DIM, bg=BG, font=self.f_mono, justify="left", wraplength=px(600),
+                 anchor="w").grid(row=2, column=1, columnspan=3, sticky="w", pady=(px(8), 0))
 
         # Action buttons
         bf = tk.Frame(body, bg=BG)
@@ -1245,7 +1587,7 @@ class App:
             (True, f"tunnel layer ...... {platform.system().lower()}"),
             (bool(ff), "ffmpeg ............ " + ("online" if ff else "MISSING")),
             (bool(dn), "js runtime ........ " + ("online" if dn else "MISSING")),
-            (True, "proxy route ....... " + (self.cfg["proxy"] if self.cfg["use_proxy"] else "direct")),
+            (True, "proxy route ....... " + (redact_proxy(self.cfg["proxy"]) if self.cfg["use_proxy"] else "direct")),
             (True, "cookie jar ........ " + (self.cfg["browser"] if self.cfg["use_cookies"] else "off")),
             (True, "handshake complete"),
         ]
@@ -1328,13 +1670,14 @@ class App:
             d = app_dir()
             d.mkdir(parents=True, exist_ok=True)
             with (d / "crash.log").open("a", encoding="utf-8") as f:
-                f.write(f"{datetime.now().isoformat()}\n{text}\n")
+                f.write(f"{datetime.now().isoformat()}\n{redact(text)}\n")
         except Exception:
             pass
         self.write(f"Internal error: {val}", "err")
 
     # ---------- log and queue ----------
     def write(self, text, tag="text"):
+        text = redact(text)
         self.log.configure(state="normal")
         self.log.insert("end", text + "\n", tag)
         self.log.configure(state="disabled")
@@ -1368,18 +1711,24 @@ class App:
                             APP_NAME, f"Version {tag} is available. You have {VERSION}.\n\n"
                                       f"Download{mb} and install it now? The app restarts when done."):
                         threading.Thread(target=self.download_update_worker,
-                                         args=(url, tag, self.current_proxy(), aname, sums_url),
+                                         args=(url, tag, self.current_proxy(), aname, sums_url, size),
                                          daemon=True).start()
                     else:
                         self.updating = False
                         self.set_update_buttons(True)
+                        self.var_status.set("Ready")
+                        if self.pending_restart:
+                            # yt-dlp was updated earlier in this run and the user skipped the app update.
+                            self.q.put(("ask_restart", "yt-dlp was updated."))
                 elif kind == "ask_restart":
+                    self.pending_restart = False
                     if messagebox.askyesno(APP_NAME, item[1] + "\n\nRestart the app now to use it?"):
                         try:
                             restart_app()
                             self.root.destroy()
                             return
-                        except Exception:
+                        except Exception as e:
+                            debug_log(f"restart_app: {e}")
                             messagebox.showinfo(APP_NAME, "Please close and reopen the app.")
                 elif kind == "quit":
                     self.root.destroy()
@@ -1388,7 +1737,6 @@ class App:
             pass
         self.root.after(40, self.poll)
 
-    # ---------- download flow ----------
     # ---------- updates ----------
     def current_proxy(self) -> str:
         if self.sw_proxy.get() and self.var_proxy.get().strip():
@@ -1427,17 +1775,30 @@ class App:
             changed = update_ytdlp_lib(proxy, lambda m, t="text": q.put(("log", m, t)))
         except Exception as e:
             q.put(("log", f"Update failed: {clean(e)}", "err"))
+        if not CAN_SELF_UPDATE:
+            q.put(("log", "Self-update of the app is not available on this system.", "dim"))
+            if changed:
+                q.put(("ask_restart", "yt-dlp was updated."))
+            q.put(("status", "Ready"))
+            q.put(("update_done",))
+            return
         q.put(("log", "Checking for a newer app (ffmpeg, Deno and curl_cffi come with it)...", "dim"))
+        # If an app update is offered and declined (or fails), the restart prompt for the
+        # yt-dlp update is shown from there; see pending_restart in poll() and the update worker.
+        self.pending_restart = changed
         offered = self.update_check_worker(proxy, False)  # sends update_done itself unless it offers an update
-        if changed and not offered:
-            q.put(("ask_restart", "yt-dlp was updated."))
-        q.put(("status", "Ready"))
+        if not offered:
+            self.pending_restart = False
+            if changed:
+                q.put(("ask_restart", "yt-dlp was updated."))
+            q.put(("status", "Ready"))
 
     def auto_check(self):
-        if FROZEN and REPO and not self.busy and not self.updating:
+        if FROZEN and CAN_SELF_UPDATE and REPO and not self.busy and not self.updating:
             self._begin_update(self.update_check_worker, self.current_proxy(), True)
 
-    def update_check_worker(self, proxy, silent):
+    def update_check_worker(self, proxy, silent) -> bool:
+        """Returns True only if an update was offered to the user (update_done is sent later)."""
         q = self.q
         try:
             rel = fetch_latest_release(proxy)
@@ -1446,12 +1807,12 @@ class App:
                 if not silent:
                     q.put(("log", f"You are up to date (version {VERSION}).", "ok"))
                 q.put(("update_done",))
-                return
+                return False
             asset = pick_release_asset(rel.get("assets", []))
             if not asset:
                 q.put(("log", f"Version {tag} exists but has no build for your system.", "warn"))
                 q.put(("update_done",))
-                return
+                return False
             sums = next((a for a in rel.get("assets", []) if a.get("name") == "SHA256SUMS.txt"), None)
             q.put(("ask_update", tag, asset["browser_download_url"], int(asset.get("size") or 0),
                    asset["name"], sums["browser_download_url"] if sums else ""))
@@ -1459,9 +1820,12 @@ class App:
         except Exception as e:
             if not silent:
                 q.put(("log", f"Update check failed: {clean(e)}", "err"))
+            else:
+                debug_log(f"auto update check: {clean(e)}")
             q.put(("update_done",))
+            return False
 
-    def download_update_worker(self, url, tag, proxy, aname="", sums_url=""):
+    def download_update_worker(self, url, tag, proxy, aname="", sums_url="", size=0):
         q = self.q
         exe = Path(sys.executable)
         new = _sidecar(exe, ".new")
@@ -1475,17 +1839,22 @@ class App:
 
         try:
             q.put(("log", f"Downloading version {tag}...", "info"))
-            download_asset(url, new, proxy, prog)
-            if sums_url:
-                sums_file = new.with_name(new.name + ".sums")
-                try:
-                    download_asset_raw(sums_url, sums_file, proxy)
-                    want = parse_sums(sums_file.read_text(encoding="utf-8", errors="replace")).get(aname)
-                finally:
-                    sums_file.unlink(missing_ok=True)
-                if want and sha256_file(new) != want:
-                    raise RuntimeError("Checksum mismatch, the download was discarded.")
-                q.put(("log", "Checksum verified.", "dim"))
+            download_asset(url, new, proxy, prog, max_bytes=(size + 65536) if size else 0)
+            # Note: SHA256SUMS.txt comes from the same GitHub release as the program, so this check
+            # detects a corrupted or truncated download, not a tampered release. Say so in the README.
+            if not sums_url:
+                raise RuntimeError("This release has no SHA256SUMS.txt. Update aborted.")
+            sums_file = new.with_name(new.name + ".sums")
+            try:
+                download_asset_raw(sums_url, sums_file, proxy, max_bytes=MAX_SUMS_DOWNLOAD)
+                want = parse_sums(sums_file.read_text(encoding="utf-8", errors="replace")).get(aname)
+            finally:
+                sums_file.unlink(missing_ok=True)
+            if not want:
+                raise RuntimeError(f"Checksum for {aname} was not found. Update aborted.")
+            if sha256_file(new) != want:
+                raise RuntimeError("Checksum mismatch, the download was discarded.")
+            q.put(("log", "Checksum verified.", "dim"))
             q.put(("log", "Installing and restarting...", "ok"))
             apply_exe_update(new)
             q.put(("quit",))
@@ -1498,6 +1867,8 @@ class App:
             q.put(("status", "Ready"))
             q.put(("progress", 0))
             q.put(("update_done",))
+            if self.pending_restart:
+                q.put(("ask_restart", "yt-dlp was updated."))
 
     def update_source_worker(self, finish=True):
         q = self.q
@@ -1548,6 +1919,7 @@ class App:
         if finish:
             q.put(("update_done",))
 
+    # ---------- download flow ----------
     def start_download(self):
         if self.updating:
             self.var_status.set("Wait for the update task to finish")
@@ -1575,18 +1947,23 @@ class App:
             return
 
         use_cookies = self.sw_cookies.get()
+        all_browsers = self.sw_all_browsers.get()
         browser = self.var_browser.get().strip().lower()
         profile = self.var_profile.get().strip()
+        if profile:
+            profile = os.path.expandvars(os.path.expanduser(profile))
         cookies = None
         if use_cookies and browser:
             cookies = (browser, profile) if profile else (browser,)
-        # Detected browser profiles are the automatic fallback when YouTube asks to sign in.
-        # Same behavior on Windows and Linux, regardless of the Cookies toggle.
-        fallback_cookies = detect_browser_cookie_sources(browser, profile)
+        # Detected profiles are the automatic fallback when YouTube asks to sign in. Other browsers'
+        # cookies are only included if the user switched that option on.
+        fallback_cookies = (detect_browser_cookie_sources(browser, profile, all_browsers)
+                            if use_cookies else [])
 
         self.cfg = {
             "out_dir": str(out_dir), "proxy": proxy_raw, "use_proxy": use_proxy,
-            "use_cookies": use_cookies, "browser": browser, "profile": profile,
+            "use_cookies": use_cookies, "cookie_all_browsers": all_browsers,
+            "browser": browser, "profile": profile,
         }
         save_settings(self.cfg)
 
@@ -1624,24 +2001,32 @@ class App:
             if not is_file and is_youtube_playlist(user_input):
                 L("Playlist detected. Fetching links...", "info")
                 S("Reading playlist...")
-                links, title = [], "playlist"
+                title, links, fetch_err = "playlist", [], ""
                 try:
                     title, links = fetch_playlist_links(user_input, proxy, cookies, fallback_cookies)
                 except Exception as e:
-                    L(f"Playlist fetch failed: {clean(e)}", "warn")
-                if links:
-                    temp_list = out_dir / f"playlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                    try:
-                        with temp_list.open("w", encoding="utf-8") as f:
-                            f.write(f"# {title}\n" + "\n".join(links) + "\n")
-                        L(f'{len(links)} links from "{title}" written to {temp_list.name}', "ok")
-                        user_input, is_file = str(temp_list), True
-                    except Exception as e:
-                        temp_list = None
-                        L(f"Could not write the link file ({e}); downloading from memory.", "warn")
-                        urls = links
-                else:
-                    L("No videos found. Trying the link as a single video.", "warn")
+                    fetch_err = clean(e)
+                if not links:
+                    # Do not fall back to downloading the playlist URL as one video.
+                    reason = fetch_err or "the playlist is empty, private or unavailable"
+                    L(f"Could not read the playlist: {reason}", "err")
+                    hint = error_hint(reason)
+                    if hint:
+                        L(hint, "warn")
+                    if "v=" in (urlparse(user_input).query or ""):
+                        L("To download only this one video, remove the list=... part from the link.", "info")
+                    L("Nothing was downloaded. Fix the problem and press DOWNLOAD again.", "warn")
+                    return
+                temp_list = out_dir / f"playlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                try:
+                    with temp_list.open("w", encoding="utf-8") as f:
+                        f.write(f"# {title}\n" + "\n".join(links) + "\n")
+                    L(f'{len(links)} links from "{title}" written to {temp_list.name}', "ok")
+                    user_input, is_file = str(temp_list), True
+                except Exception as e:
+                    temp_list = None
+                    L(f"Could not write the link file ({e}); downloading from memory.", "warn")
+                    urls = links
 
             if is_file:
                 urls = read_url_file(Path(user_input).expanduser())
@@ -1651,12 +2036,14 @@ class App:
 
             L(f"Output: {out_dir}", "dim")
             L(f"Proxy: {proxy or 'off'}", "dim")
-            cookie_status = cookies if cookies else "automatic detection when needed"
-            L(f"Cookies: {cookie_status}", "dim")
-            if fallback_cookies:
-                L(f"Detected {len(fallback_cookies)} browser cookie profile(s).", "dim")
+            if cookies:
+                L(f"Cookies: enabled ({cookies})", "dim")
+                if fallback_cookies:
+                    L(f"Detected {len(fallback_cookies)} browser cookie profile(s) for fallback.", "dim")
+                else:
+                    L("No additional browser cookie profiles detected.", "dim")
             else:
-                L("No known browser cookie profiles detected; sign in to YouTube in a supported browser.", "dim")
+                L("Cookies: off", "dim")
             S("Downloading...")
             P(0)
 
@@ -1693,19 +2080,14 @@ class App:
                         try:
                             download_video(url, out_dir, proxy, use_ck, progress_callback=cb,
                                            cancel_event=self.cancel, impersonate=use_imp,
-                                           retries=5 if use_imp else 20)
+                                           retries=5 if use_imp else 20, batch=total > 1)
                             break
                         except yt_dlp.utils.DownloadCancelled:
                             raise
                         except Exception as first:
                             m = clean(first).lower()
-                            auth_challenge = any(
-                                phrase in m for phrase in (
-                                    "sign in to confirm", "login required", "authentication",
-                                    "confirm you're not a bot", "confirm you\u2019re not a bot",
-                                    "not a bot", "sign in",
-                                )
-                            )
+                            # A pure rate limit is not an auth problem: other cookie profiles will not help.
+                            auth_challenge = classify_error(m) in ("login", "rate_login")
                             is_youtube = "youtube.com" in url.lower() or "youtu.be/" in url.lower()
                             cookie_problem = bool(use_ck) and any(k in m for k in (
                                 "cookie", "database is locked", "could not copy", "dpapi",
@@ -1742,18 +2124,13 @@ class App:
                     failed += 1
                     msg = clean(e)
                     low = msg.lower()
-                    if "timed out" in low or "timeout" in low or "curl: (28)" in low:
-                        L("Timeout. Turn the proxy on or check its address and port.", "warn")
-                    elif "curl: (6)" in low or "could not resolve" in low:
-                        L("Cannot reach the site. Check your internet connection or turn the proxy on.", "warn")
-                    elif "login" in low or "rate-limit" in low or "sign in" in low:
-                        L("Login required. Turn Cookies on and be signed in within that browser.", "warn")
-                    elif "ffmpeg" in low:
-                        L("FFmpeg is missing or not working.", "warn")
-                    err_file = out_dir / f"error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    hint = error_hint(msg)
+                    if hint:
+                        L(hint, "warn")
+                    err_file = out_dir / f"error_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.txt"
                     try:
                         with err_file.open("w", encoding="utf-8") as f:
-                            f.write(f"URL: {url}\n\nError: {msg}\n\n{traceback.format_exc()}")
+                            f.write(redact(f"URL: {url}\n\nError: {msg}\n\n{traceback.format_exc()}"))
                         saved = f"Full error saved to: {err_file}"
                     except Exception:
                         saved = "Could not write the error file"
@@ -1769,8 +2146,8 @@ class App:
                 try:
                     temp_list.unlink()
                     L(f"Removed {temp_list.name}", "dim")
-                except Exception:
-                    pass
+                except Exception as e:
+                    debug_log(f"remove temp list: {e}")
             S(f"Finished: {ok} ok, {failed} failed")
             P(0)
             q.put(("busy", False))
@@ -1787,10 +2164,10 @@ def main():
             except Exception:
                 ctypes.windll.user32.SetProcessDPIAware()
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("retr0.downloader")
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log(f"dpi/appid: {e}")
     root = tk.Tk()
-    for cls in ("Entry", "Text"):
+    for cls in ("Entry", "Text", "TEntry", "TCombobox"):
         root.bind_class(cls, "<Control-KeyPress>", ctrl_shortcut, add="+")
     try:
         SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
