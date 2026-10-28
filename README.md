@@ -6,9 +6,9 @@ Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports thousands of
 
 ## A note from me
 
-I made this app for myself. It was very simple, and I used it from the terminal. When my friends saw it, they wanted it too, so I made changes and turned it into a native app for both Windows and Linux.
+I originally built this app for my own use. It started as a simple command-line tool, but when my friends wanted to use it too, I decided to improve it and turn it into a native application for both Windows and Linux.
 
-If you find a bug, or you want support for a specific site, let me know.
+If you encounter a bug or would like to see support for a specific website, feel free to let me know!
 
 ## Download
 
