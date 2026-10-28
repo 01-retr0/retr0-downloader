@@ -1,8 +1,18 @@
 # Retr0 Downloader
 
-A simple desktop app that downloads the video from any web page. Copy the link of a page that has a video, paste it into the app, and get the video in the highest available quality. It works with YouTube, Instagram and almost any other site with a video player. Windows and Linux, no command line needed. Created By Retr0.
+A simple, easy-to-use desktop app for downloading videos. Paste a link, press **DOWNLOAD**, and get the video in the highest available quality. There is nothing to learn and no command line needed. It works with YouTube, Instagram and almost any other site with a video player, on Windows and Linux. Created By Retr0.
 
 Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports thousands of sites.
+
+## How to use
+
+1. Copy the link of the page that has the video.
+2. Paste it into the app and press **DOWNLOAD**.
+3. Your file is saved in the folder shown in **Save to**. Press **Open** to go straight to it.
+
+Want only the music or sound? Turn on **Audio only (MP3)** before you press DOWNLOAD.
+
+That is all most people need. The proxy and cookies options are optional, and you can ignore them unless a site refuses to download.
 
 ## A note from me
 
@@ -39,6 +49,7 @@ Some antivirus programs may flag this app as a trojan or a virus. This is a fals
 
 ## Features
 
+- Simple by design: paste a link and press DOWNLOAD. The extra options are optional and can be ignored
 - Works with almost any site that has a video, not only YouTube
 - Highest quality video and audio, merged into one file
 - Audio-only mode: turn on **Audio only (MP3)** to save just the sound as a 320 kbps MP3 (the highest quality MP3 allows). It works with single links, playlists and `.txt` files, and the setting is remembered
