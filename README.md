@@ -1,6 +1,6 @@
 # Retr0 Downloader
 
-A simple desktop app that downloads the video from any web page. Copy the link of a page that has a video, paste it into the app, and get the video in the highest available quality. It works with YouTube, Instagram and almost any other site with a video player. Windows and Linux, no Python or command line needed. Created By Retr0.
+A simple desktop app that downloads the video from any web page. Copy the link of a page that has a video, paste it into the app, and get the video in the highest available quality. It works with YouTube, Instagram and almost any other site with a video player. Windows and Linux, no command line needed. Created By Retr0.
 
 Built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), which supports thousands of sites.
 
