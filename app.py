@@ -418,6 +418,7 @@ def load_settings() -> dict:
         "cookie_all_browsers": False,
         "browser": "opera",
         "profile": default_profile(),
+        "audio_only": False,
     }
     try:
         with (app_dir() / "settings.json").open("r", encoding="utf-8") as f:
@@ -1073,7 +1074,8 @@ class _SilentLogger:
 
 
 def download_video(url, out_dir, proxy, cookies, progress_callback=None,
-                   cancel_event=None, impersonate=True, retries=20, batch=False):
+                   cancel_event=None, impersonate=True, retries=20, batch=False,
+                   audio_only=False):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     rand = uuid.uuid4().hex[:8]
 
@@ -1121,6 +1123,17 @@ def download_video(url, out_dir, proxy, cookies, progress_callback=None,
         # Pause between videos only when downloading many, to avoid rate limits.
         opts["sleep_interval"] = 1
         opts["max_sleep_interval"] = 3
+
+    if audio_only:
+        # Best audio stream, converted to MP3 at 320 kbps (the maximum for MP3).
+        opts["format"] = "bestaudio/best"
+        opts["format_sort"] = ["abr", "asr"]
+        opts.pop("merge_output_format", None)
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "320",
+        }]
 
     deno = find_deno()
     if deno:
@@ -1552,6 +1565,10 @@ class App:
         self.btn_stop.pack(side="left", padx=(0, px(10)))
         self.btn_stop.set_enabled(False)
         Btn(left, "Clear", self.clear_log, CYAN, font=self.f_bold).pack(side="left")
+        self.sw_audio = Toggle(right, self.cfg.get("audio_only", False))
+        self.sw_audio.pack(side="left", padx=(0, px(10)))
+        tk.Label(right, text="Audio only (MP3)", fg=CYAN, bg=BG, font=self.f_bold).pack(
+            side="left", padx=(0, px(24)))
         self.btn_upd_app = Btn(right, "Update", self.update_all, CYAN, font=self.f_bold)
         self.btn_upd_app.pack(side="left")
 
@@ -1947,6 +1964,7 @@ class App:
             return
 
         use_cookies = self.sw_cookies.get()
+        audio_only = self.sw_audio.get()
         all_browsers = self.sw_all_browsers.get()
         browser = self.var_browser.get().strip().lower()
         profile = self.var_profile.get().strip()
@@ -1963,7 +1981,7 @@ class App:
         self.cfg = {
             "out_dir": str(out_dir), "proxy": proxy_raw, "use_proxy": use_proxy,
             "use_cookies": use_cookies, "cookie_all_browsers": all_browsers,
-            "browser": browser, "profile": profile,
+            "browser": browser, "profile": profile, "audio_only": audio_only,
         }
         save_settings(self.cfg)
 
@@ -1972,11 +1990,11 @@ class App:
         self.set_busy(True)
         threading.Thread(
             target=self.worker,
-            args=(raw, out_dir, proxy, cookies, fallback_cookies),
+            args=(raw, out_dir, proxy, cookies, fallback_cookies, audio_only),
             daemon=True,
         ).start()
 
-    def worker(self, user_input, out_dir, proxy, cookies, fallback_cookies=None):
+    def worker(self, user_input, out_dir, proxy, cookies, fallback_cookies=None, audio_only=False):
         q = self.q
 
         def L(msg, tag="text"):
@@ -2059,7 +2077,7 @@ class App:
                 def cb(downloaded, size, speed, eta, finished=False, prefix=prefix):
                     if finished:
                         P(100)
-                        S(prefix + "Merging...")
+                        S(prefix + ("Converting to MP3..." if audio_only else "Merging..."))
                         return
                     if size and size > 0:
                         pct = min(int(downloaded / size * 100), 99)
@@ -2080,7 +2098,8 @@ class App:
                         try:
                             download_video(url, out_dir, proxy, use_ck, progress_callback=cb,
                                            cancel_event=self.cancel, impersonate=use_imp,
-                                           retries=5 if use_imp else 20, batch=total > 1)
+                                           retries=5 if use_imp else 20, batch=total > 1,
+                                           audio_only=audio_only)
                             break
                         except yt_dlp.utils.DownloadCancelled:
                             raise
