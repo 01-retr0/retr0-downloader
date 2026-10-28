@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Retr0 Downloader: desktop GUI around yt-dlp. Created By Retr0."""
+# Copyright (C) Retr0
+# Licensed under the GNU General Public License v3.0. See the LICENSE file.
 import hashlib
 import configparser
 import json
